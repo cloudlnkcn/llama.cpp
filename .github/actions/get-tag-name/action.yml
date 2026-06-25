@@ -1,0 +1,16 @@
+name: "Determine tag name"
+description: "Determine the tag name to use for a release"
+outputs:
+  name:
+    description: "The name of the tag"
+    value: ${{ steps.tag.outputs.name }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Determine tag name
+      id: tag
+      shell: bash
+      run: |
+        BUILD_NUMBER="$(git rev-list --count HEAD)"
+        echo "name=b${BUILD_NUMBER}" >> $GITHUB_OUTPUT
