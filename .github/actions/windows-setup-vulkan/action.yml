@@ -1,0 +1,57 @@
+name: "Windows - Setup Vulkan SDK"
+description: "Setup Vulkan SDK for Windows"
+inputs:
+  version:
+    description: "Vulkan SDK version (e.g., 1.4.341.0)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Vulkan SDK
+      shell: pwsh
+      env:
+        VULKAN_VERSION: ${{ inputs.version }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $version = $env:VULKAN_VERSION
+        $installRoot = "C:\VulkanSDK\$version"
+
+        # The Vulkan SDK installer is a Qt IFW-based installer. These flags
+        # run it fully unattended without requiring administrator elevation:
+        #   --accept-alllicenses   auto-accept every license prompt
+        #   --root                 install directory (skips the prompt for it)
+        #   --silent               no UI
+        #   --default-desktop      skip the "set as default" interactive step
+        $args = @(
+          '--accept-alllicenses',
+          '--root', $installRoot,
+          '--silent',
+          '--default-desktop'
+        )
+
+        $url = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
+        Write-Host "Downloading Vulkan SDK $version installer"
+        Invoke-WebRequest -Uri $url -OutFile "${env:RUNNER_TEMP}\vulkansdk-installer.exe"
+
+        Write-Host "Installing Vulkan SDK to $installRoot"
+        $proc = Start-Process "${env:RUNNER_TEMP}\vulkansdk-installer.exe" -ArgumentList $args -NoNewWindow -PassThru
+        $completed = $proc.WaitForExit(900000) # 15 minutes
+        if (-not $completed) {
+          Write-Error "Vulkan SDK installer timed out. Killing the process."
+          $proc.Kill()
+          exit 1
+        }
+        if ($proc.ExitCode -ne 0) {
+          Write-Error "Vulkan SDK installer failed with exit code $($proc.ExitCode)"
+          exit 1
+        }
+
+        if (-not (Test-Path $installRoot)) {
+          Write-Error "Vulkan SDK install directory $installRoot was not created"
+          exit 1
+        }
+
+        Write-Host "Vulkan SDK installed at $installRoot"
+        echo "VULKAN_SDK=$installRoot" >> $env:GITHUB_ENV
+        echo "$installRoot\Bin" >> $env:GITHUB_PATH

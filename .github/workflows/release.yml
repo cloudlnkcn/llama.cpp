@@ -581,6 +581,130 @@ jobs:
           path: llama-bin-ubuntu-openvino-${{ env.OPENVINO_VERSION_MAJOR }}-x64.tar.gz
           name: llama-bin-ubuntu-openvino-${{ env.OPENVINO_VERSION_MAJOR }}-x64.tar.gz
 
+  ubuntu-vulkan:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Build across the supported Ubuntu range: 22.04 (oldest, lowest glibc
+        # — portable to anything newer) up to 24.04 (current LTS/latest).
+        include:
+          - os: ubuntu-22.04
+            ubuntu_version: "2204"
+          - os: ubuntu-24.04
+            ubuntu_version: "2404"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          repository: 'ggml-org/llama.cpp'
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: ubuntu-vulkan-${{ matrix.ubuntu_version }}
+          evict-old-files: 1d
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build patchelf \
+            libvulkan-dev glslc spirv-headers spirv-tools
+
+      - name: Build
+        run: |
+          cmake -B build -S . \
+            -DGGML_VULKAN=ON \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_OPENMP=OFF \
+            -DGGML_STATIC=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Set RPATH for portable distribution
+        run: |
+          for f in build/bin/*; do
+            [ -f "$f" ] && ! [ -L "$f" ] || continue
+            if file "$f" | grep -q 'ELF'; then
+              patchelf --set-rpath '$ORIGIN' "$f"
+            fi
+          done
+
+      - name: Validate Vulkan package contents
+        run: |
+          shopt -s nullglob
+
+          required_libs=(libggml-vulkan.so libggml.so)
+          for lib in "${required_libs[@]}"; do
+            matches=(build/bin/${lib}*)
+            if [ ${#matches[@]} -eq 0 ]; then
+              echo "::error::Missing required library matching ${lib}*"
+              exit 1
+            fi
+          done
+
+          smoke_bin=""
+          if [ -x build/bin/llama-server ]; then
+            smoke_bin=build/bin/llama-server
+          else
+            smoke_bin=$(find build/bin -maxdepth 1 -type f -name 'llama-*' -perm -111 | head -n 1)
+          fi
+          if [ -z "$smoke_bin" ]; then
+            echo "::error::No llama executable found for smoke testing"
+            exit 1
+          fi
+          "$smoke_bin" --version >/dev/null
+
+          for f in build/bin/*; do
+            [ -f "$f" ] && ! [ -L "$f" ] || continue
+            if ! file "$f" | grep -q 'ELF'; then
+              continue
+            fi
+
+            rpath=$(patchelf --print-rpath "$f")
+            if [ "$rpath" != '$ORIGIN' ]; then
+              echo "::error::Unexpected RPATH '$rpath' for $f"
+              exit 1
+            fi
+
+            # libvulkan.so.1 is the system Vulkan loader, provided by the GPU
+            # driver at runtime — never bundle it. Treat it as resolved.
+            missing=$(ldd "$f" | awk '/=> not found/ && $1 != "libvulkan.so.1" { print }')
+            if [ -n "$missing" ]; then
+              echo "::error::Unresolved runtime dependencies for $f"
+              echo "$missing"
+              exit 1
+            fi
+          done
+
+      - name: Determine tag name
+        id: tag
+        uses: lemonade-sdk/llama.cpp/.github/actions/get-tag-name@lemonade
+
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          # Stage into a versioned top-level directory so extraction lands in a
+          # single llama-<tag>/ folder, matching the CUDA Linux tarball layout.
+          pkgdir="llama-${{ steps.tag.outputs.name }}"
+          mkdir -p "$pkgdir"
+          cp -a build/bin/. "$pkgdir/"
+          tar -cJf llama-ubuntu-vulkan-x64-ubuntu-${{ matrix.ubuntu_version }}.tar.xz "$pkgdir"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-ubuntu-vulkan-x64-ubuntu-${{ matrix.ubuntu_version }}.tar.xz
+          name: llama-ubuntu-vulkan-x64-ubuntu-${{ matrix.ubuntu_version }}.tar.xz
+
   windows-cpu:
     runs-on: windows-2025
 
@@ -898,6 +1022,114 @@ jobs:
           path: llama-windows-cuda-${{ matrix.sm }}-x64.7z
           name: llama-windows-cuda-${{ matrix.sm }}-x64.7z
 
+  windows-vulkan:
+    runs-on: windows-2022
+    needs:
+      - windows-cpu
+
+    env:
+      VULKAN_SDK_VERSION: "1.4.341.0"
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          repository: 'ggml-org/llama.cpp'
+
+      - name: Setup Vulkan SDK
+        uses: lemonade-sdk/llama.cpp/.github/actions/windows-setup-vulkan@lemonade
+        with:
+          version: ${{ env.VULKAN_SDK_VERSION }}
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-vulkan-${{ env.VULKAN_SDK_VERSION }}
+          variant: ccache
+          evict-old-files: 1d
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_VULKAN=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release
+
+      - name: Download CPU backend artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: llama-bin-win-cpu-x64.zip
+          path: .\cpu-artifact
+
+      - name: Pack artifacts
+        run: |
+          $releaseDir = '.\build\bin\Release'
+          $cpuArchive = '.\cpu-artifact\llama-bin-win-cpu-x64.zip'
+          $cpuExtractDir = Join-Path $env:RUNNER_TEMP "cpu-backend-vulkan"
+
+          if (-not (Test-Path $cpuArchive)) {
+            throw "Missing required CPU backend artifact: $cpuArchive"
+          }
+          if (Test-Path $cpuExtractDir) {
+            Remove-Item $cpuExtractDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $cpuExtractDir | Out-Null
+          Expand-Archive -Path $cpuArchive -DestinationPath $cpuExtractDir -Force
+          Copy-Item (Join-Path $cpuExtractDir '*') $releaseDir -Recurse -Force
+          Copy-Item LICENSE $releaseDir
+
+          $vulkanDll = Get-ChildItem -Path $releaseDir -Filter "ggml-vulkan*.dll" -ErrorAction SilentlyContinue
+          if (-not $vulkanDll) {
+            Write-Host "##[error]ggml-vulkan*.dll was NOT produced in the final package layout."
+            Write-Host "Contents of ${releaseDir}:"
+            Get-ChildItem $releaseDir | Format-Table -AutoSize
+            exit 1
+          }
+
+          $smokeExe = $null
+          foreach ($name in @('llama-cli.exe', 'llama-server.exe')) {
+            $candidate = Get-ChildItem -Path $releaseDir -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($candidate) {
+              $smokeExe = $candidate
+              break
+            }
+          }
+          if (-not $smokeExe) {
+            $smokeExe = Get-ChildItem -Path $releaseDir -Filter 'llama-*.exe' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -First 1
+          }
+          if (-not $smokeExe) {
+            throw "No llama executable found for staged Windows Vulkan smoke test"
+          }
+
+          Push-Location $releaseDir
+          try {
+            & ".\$($smokeExe.Name)" --version | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Smoke test failed for $($smokeExe.Name) with exit code $LASTEXITCODE"
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+          7z a -snl llama-bin-win-vulkan-x64.zip "$releaseDir\\*"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-vulkan-x64.zip
+          name: llama-bin-win-vulkan-x64.zip
+
   release:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.create_release == 'true' }}
 
@@ -912,10 +1144,12 @@ jobs:
       - windows-cpu
       - windows-rocm
       - windows-cuda
+      - windows-vulkan
       - ubuntu-22-rocm
       - ubuntu-22-cuda
       - ubuntu-22-cuda-arm64
       - ubuntu-22-openvino
+      - ubuntu-vulkan
 
     steps:
       - name: Clone
@@ -990,6 +1224,15 @@ jobs:
             mv "$tar_file" "release/$tar_name"
           done
 
+          echo "Renaming and moving Vulkan tar.xz artifacts to release..."
+          for tar_file in artifact/llama-ubuntu-vulkan-*.tar.xz; do
+            [ -f "$tar_file" ] || continue
+            base_name=$(basename "$tar_file" .tar.xz)
+            tar_name="llama-${{ steps.tag.outputs.name }}-${base_name#llama-}.tar.xz"
+            echo "Moving $tar_file to release/$tar_name"
+            mv "$tar_file" "release/$tar_name"
+          done
+
           echo "Renaming and moving CUDA .7z artifacts to release..."
           for z_file in artifact/llama-windows-cuda-*.7z; do
             [ -f "$z_file" ] || continue
@@ -1050,10 +1293,12 @@ jobs:
                 '- Ubuntu x64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-x64.tar.xz` (replace XX with your GPU compute capability)',
                 '- Ubuntu arm64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-arm64.tar.xz` (replace XX with your GPU compute capability)',
                 `- [Ubuntu x64 (OpenVINO 2026.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz)`,
+                '- Ubuntu x64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-x64-ubuntu-XXXX.tar.xz` (choose the matching Ubuntu version: 2204 or 2404)',
                 '',
                 '**Windows:**',
                 `- [Windows x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-rocm-7.13-x64.zip)`,
                 '- Windows x64 (CUDA): `llama-' + tag + '-windows-cuda-sm_XX-x64.7z` (replace XX with your GPU compute capability)',
+                `- [Windows x64 (Vulkan 1.4.341.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-vulkan-x64.zip)`,
               ].join('\n');
               try {
                 release = (await github.rest.repos.createRelease({ owner, repo, tag_name: tag, body })).data;
