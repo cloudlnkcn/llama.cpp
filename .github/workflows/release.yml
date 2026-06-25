@@ -991,21 +991,21 @@ jobs:
           Write-Host "Downloading Vulkan SDK $version installer"
           Invoke-WebRequest -Uri $url -OutFile "${env:RUNNER_TEMP}\vulkansdk-installer.exe"
 
-          # The Vulkan SDK installer is Qt-IFW-based. Per LunarG's official docs,
-          # the unattended invocation is:
-          #   in --accept-licenses --confirm-command install
+          # The Vulkan SDK installer is Qt-IFW-based. Per LunarG's official docs
+          # the usage is: [options] command <args> <key=value>
+          # Pass options first, then the `install` command, then key=value pairs.
           # `copy_only=1` skips the steps that need administrator privileges
           # (Vulkan runtime/driver install) so it runs on a non-elevated runner.
           Write-Host "Installing Vulkan SDK to $installRoot"
           $installerArgs = @(
-            "in", "--accept-licenses", "--default-answer", "--confirm-command",
-            "--root", "$installRoot",
-            "copy_only=1",
-            "install"
+            '--accept-licenses', '--default-answer', '--confirm-command',
+            '--root', "`"$installRoot`"",
+            'install',
+            'copy_only=1'
           )
-          $proc = Start-Process "${env:RUNNER_TEMP}\vulkansdk-installer.exe" -ArgumentList $installerArgs -NoNewWindow -PassThru -Wait
-          if ($proc.ExitCode -ne 0) {
-            Write-Error "Vulkan SDK installer failed with exit code $($proc.ExitCode)"
+          & "${env:RUNNER_TEMP}\vulkansdk-installer.exe" $installerArgs
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Vulkan SDK installer failed with exit code $LASTEXITCODE"
             exit 1
           }
 
