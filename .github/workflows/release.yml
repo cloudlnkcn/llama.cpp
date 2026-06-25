@@ -2,13 +2,23 @@ name: Release
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # every 6 hours (4 times daily)
+    - cron: '0 0 * * 0' # every Sunday 00:00 UTC (北京 08:00)
   workflow_dispatch: # allows manual triggering
     inputs:
       create_release:
         description: 'Create new release'
         required: true
         type: boolean
+        default: true
+      upstream_tag:
+        description: 'Upstream llama.cpp release tag to build (leave empty to auto-pick the latest, e.g. b9788)'
+        required: false
+        type: string
+      force_build:
+        description: 'Force a rebuild even if this tag already has a release here (refills missing assets)'
+        required: false
+        type: boolean
+        default: false
   pull_request: # validate the release build on PRs; the release job is skipped so nothing is published
     paths:
       # The build jobs clone llama.cpp source from upstream and the get-tag-name
@@ -25,7 +35,59 @@ env:
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
 
 jobs:
+  # Resolve the upstream llama.cpp release tag to build, once, and decide whether
+  # a build is needed. All build jobs depend on this so they share a single,
+  # race-free tag decision (avoiding 9 jobs each querying upstream and racing a
+  # release flip), and can be skipped together when the tag is already built.
+  resolve-upstream-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+
+    steps:
+      - name: Resolve upstream tag and dedup
+        id: resolve
+        uses: actions/github-script@v8
+        env:
+          INPUT_TAG: ${{ github.event.inputs.upstream_tag }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build }}
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+        with:
+          script: |
+            // 1. Pick the upstream tag: manual input wins, otherwise the latest
+            //    non-prerelease release of ggml-org/llama.cpp.
+            let tag = process.env.INPUT_TAG;
+            if (!tag) {
+              tag = (await github.rest.repos.getLatestRelease({
+                owner: 'ggml-org',
+                repo: 'llama.cpp'
+              })).data.tag_name;
+            }
+            core.info(`Upstream tag to build: ${tag}`);
+
+            // 2. Dedup. PRs and force_build always build (PRs to keep their
+            //    validation value; force_build to refill missing assets).
+            //    Otherwise, if a release already exists for this tag in *this*
+            //    repo, skip the whole pipeline.
+            let shouldBuild = true;
+            const skipDedup = process.env.IS_PR === 'true' || process.env.FORCE_BUILD === 'true';
+            if (!skipDedup) {
+              try {
+                await github.rest.repos.getReleaseByTag({ ...context.repo, tag });
+                shouldBuild = false;
+                core.info(`Release for ${tag} already exists in this repo — skipping build.`);
+              } catch (e) {
+                if (e.status !== 404) throw e;
+              }
+            }
+
+            core.setOutput('tag', tag);
+            core.setOutput('should_build', String(shouldBuild));
+
   ubuntu-22-rocm:
+    needs: resolve-upstream-tag
+    if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     runs-on: ubuntu-22.04
 
     strategy:
@@ -42,6 +104,7 @@ jobs:
         with:
           fetch-depth: 0
           repository: 'ggml-org/llama.cpp'
+          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -126,6 +189,8 @@ jobs:
           name: llama-bin-ubuntu-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.tar.gz
 
   ubuntu-22-cuda:
+    needs: resolve-upstream-tag
+    if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     runs-on: ubuntu-22.04
 
     strategy:
@@ -133,7 +198,7 @@ jobs:
       matrix:
         # On PRs only build one representative arch (packaging logic is identical
         # across all sm_*); build the full matrix on schedule/dispatch.
-        sm: ${{ github.event_name == 'pull_request' && fromJSON('["sm_89"]') || fromJSON('["sm_75", "sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_120", "sm_121"]') }}
+        sm: ${{ github.event_name == 'pull_request' && fromJSON('["sm_89"]') || fromJSON('["sm_70", "sm_75", "sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_120"]') }}
 
     steps:
       - name: Clone
@@ -142,6 +207,7 @@ jobs:
         with:
           fetch-depth: 0
           repository: 'ggml-org/llama.cpp'
+          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -283,165 +349,9 @@ jobs:
           path: llama-ubuntu-cuda-${{ matrix.sm }}-x64.tar.xz
           name: llama-ubuntu-cuda-${{ matrix.sm }}-x64.tar.xz
 
-  ubuntu-22-cuda-arm64:
-    runs-on: ubuntu-22.04-arm
-
-    strategy:
-      fail-fast: false
-      matrix:
-        # On PRs only build one representative arch (packaging logic is identical
-        # across all sm_*); build the full matrix on schedule/dispatch.
-        sm: ${{ github.event_name == 'pull_request' && fromJSON('["sm_89"]') || fromJSON('["sm_75", "sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_120", "sm_121"]') }}
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          repository: 'ggml-org/llama.cpp'
-
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
-        with:
-          key: ubuntu-cuda-arm64-${{ matrix.sm }}
-          evict-old-files: 1d
-
-      - name: Free disk space
-        run: |
-          sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' 'ruby.*' \
-            google-cloud-cli azure-cli google-chrome-stable firefox powershell 2>/dev/null || true
-          sudo apt-get autoremove -y
-          df -h
-
-      - name: Install CUDA Toolkit
-        run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update
-          sudo apt-get install -y cuda-toolkit-12-9 cmake ninja-build patchelf
-
-      - name: Set CUDA environment
-        run: |
-          echo "CUDA_PATH=/usr/local/cuda" >> "$GITHUB_ENV"
-          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-
-      - name: Build
-        run: |
-          cmake_arch="${{ matrix.sm }}"
-          cmake_arch="${cmake_arch#sm_}"
-          cmake -B build -S . \
-            -DGGML_CUDA=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="${cmake_arch}" \
-            -DBUILD_SHARED_LIBS=ON \
-            -DGGML_NATIVE=OFF \
-            -DGGML_BACKEND_DL=ON \
-            -DGGML_OPENMP=OFF \
-            -DGGML_STATIC=OFF \
-            -DLLAMA_BUILD_BORINGSSL=ON \
-            -DCMAKE_BUILD_TYPE=Release \
-            ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc)
-
-      - name: Bundle CUDA runtime libraries
-        run: |
-          cuda_lib=/usr/local/cuda/lib64
-          cp -av ${cuda_lib}/libcudart.so*   build/bin/
-          cp -av ${cuda_lib}/libcublas.so*   build/bin/
-          cp -av ${cuda_lib}/libcublasLt.so* build/bin/
-          cp -av ${cuda_lib}/libcurand.so*   build/bin/
-          cp -av ${cuda_lib}/libnvJitLink.so* build/bin/
-
-      - name: Set RPATH for portable distribution
-        run: |
-          for f in build/bin/*; do
-            [ -f "$f" ] && ! [ -L "$f" ] || continue
-            if file "$f" | grep -q 'ELF'; then
-              patchelf --set-rpath '$ORIGIN' "$f"
-            fi
-          done
-
-      - name: Validate CUDA package contents
-        run: |
-          shopt -s nullglob
-
-          required_libs=(
-            libcudart.so
-            libcublas.so
-            libcublasLt.so
-            libcurand.so
-            libnvJitLink.so
-          )
-          for lib in "${required_libs[@]}"; do
-            matches=(build/bin/${lib}*)
-            if [ ${#matches[@]} -eq 0 ]; then
-              echo "::error::Missing required CUDA runtime library matching ${lib}*"
-              exit 1
-            fi
-          done
-
-          smoke_bin=""
-          if [ -x build/bin/llama-cli ]; then
-            smoke_bin=build/bin/llama-cli
-          elif [ -x build/bin/llama-server ]; then
-            smoke_bin=build/bin/llama-server
-          else
-            smoke_bin=$(find build/bin -maxdepth 1 -type f -name 'llama-*' -perm -111 | head -n 1)
-          fi
-
-          if [ -z "$smoke_bin" ]; then
-            echo "::error::No llama executable found for smoke testing"
-            exit 1
-          fi
-
-          "$smoke_bin" --version >/dev/null
-
-          for f in build/bin/*; do
-            [ -f "$f" ] && ! [ -L "$f" ] || continue
-            if ! file "$f" | grep -q 'ELF'; then
-              continue
-            fi
-
-            rpath=$(patchelf --print-rpath "$f")
-            if [ "$rpath" != '$ORIGIN' ]; then
-              echo "::error::Unexpected RPATH '$rpath' for $f"
-              exit 1
-            fi
-
-            missing=$(ldd "$f" | awk '/=> not found/ && $1 != "libcuda.so.1" { print }')
-            if [ -n "$missing" ]; then
-              echo "::error::Unresolved runtime dependencies for $f"
-              echo "$missing"
-              exit 1
-            fi
-          done
-
-      - name: Determine tag name
-        id: tag
-        uses: lemonade-sdk/llama.cpp/.github/actions/get-tag-name@lemonade
-
-      - name: Pack artifacts
-        id: pack_artifacts
-        run: |
-          cp LICENSE ./build/bin/
-          # Stage into a versioned top-level directory so extraction lands in a
-          # single llama-<tag>/ folder, matching the ROCm Linux tarball layout.
-          # Build the directory explicitly rather than via tar --transform, which
-          # only rewrites paths when tar preserves the leading ./ on members and
-          # so behaves differently across tar versions/runners.
-          pkgdir="llama-${{ steps.tag.outputs.name }}"
-          mkdir -p "$pkgdir"
-          cp -a build/bin/. "$pkgdir/"
-          tar -cJf llama-ubuntu-cuda-${{ matrix.sm }}-arm64.tar.xz "$pkgdir"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          path: llama-ubuntu-cuda-${{ matrix.sm }}-arm64.tar.xz
-          name: llama-ubuntu-cuda-${{ matrix.sm }}-arm64.tar.xz
-
   ubuntu-22-openvino:
+    needs: resolve-upstream-tag
+    if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     runs-on: ubuntu-22.04
 
     env:
@@ -455,6 +365,7 @@ jobs:
         with:
           fetch-depth: 0
           repository: 'ggml-org/llama.cpp'
+          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -582,6 +493,8 @@ jobs:
           name: llama-bin-ubuntu-openvino-${{ env.OPENVINO_VERSION_MAJOR }}-x64.tar.gz
 
   ubuntu-vulkan:
+    needs: resolve-upstream-tag
+    if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -602,6 +515,7 @@ jobs:
         with:
           fetch-depth: 0
           repository: 'ggml-org/llama.cpp'
+          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -706,12 +620,9 @@ jobs:
           name: llama-ubuntu-vulkan-x64-ubuntu-${{ matrix.ubuntu_version }}.tar.xz
 
   windows-cpu:
+    needs: resolve-upstream-tag
+    if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     runs-on: windows-2025
-
-    strategy:
-      matrix:
-        include:
-          - arch: 'x64'
 
     steps:
       - name: Clone
@@ -720,11 +631,12 @@ jobs:
         with:
           fetch-depth: 0
           repository: 'ggml-org/llama.cpp'
+          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: windows-latest-cpu-${{ matrix.arch }}
+          key: windows-latest-cpu-x64
           variant: ccache
           evict-old-files: 1d
 
@@ -735,13 +647,13 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.arch == 'x64' && 'x64' || 'amd64_arm64' }}
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
-            -D CMAKE_TOOLCHAIN_FILE=cmake/${{ matrix.arch }}-windows-llvm.cmake ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DGGML_NATIVE=OFF ^
             -DGGML_BACKEND_DL=ON ^
-            -DGGML_CPU_ALL_VARIANTS=${{ matrix.arch == 'x64' && 'ON' || 'OFF' }} ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
             -DGGML_OPENMP=ON ^
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release
@@ -750,7 +662,6 @@ jobs:
         id: pack_artifacts
         shell: pwsh
         run: |
-          $archSuffix = if ('${{ matrix.arch }}' -eq 'x64') { 'x86_64' } else { 'aarch64' }
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
           $searchRoots = @()
           if (Test-Path $vswhere) {
@@ -762,21 +673,23 @@ jobs:
             $searchRoots = @("C:\Program Files\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio")
           }
           $ompDll = $searchRoots |
-            ForEach-Object { Get-ChildItem $_ -Recurse -File -Filter "libomp140.$archSuffix.dll" -ErrorAction SilentlyContinue } |
-            Where-Object { $_.FullName -like "*\debug_nonredist\${{ matrix.arch }}\*" } |
+            ForEach-Object { Get-ChildItem $_ -Recurse -File -Filter "libomp140.x86_64.dll" -ErrorAction SilentlyContinue } |
+            Where-Object { $_.FullName -like "*\debug_nonredist\x64\*" } |
             Sort-Object FullName -Descending |
             Select-Object -First 1
-          if (-not $ompDll) { throw "Could not locate libomp140.$archSuffix.dll under: $($searchRoots -join ', ')" }
+          if (-not $ompDll) { throw "Could not locate libomp140.x86_64.dll under: $($searchRoots -join ', ')" }
           Copy-Item $ompDll.FullName .\build\bin\Release\
-          7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
+          7z a -snl llama-bin-win-cpu-x64.zip .\build\bin\Release\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-cpu-${{ matrix.arch }}.zip
-          name: llama-bin-win-cpu-${{ matrix.arch }}.zip
+          path: llama-bin-win-cpu-x64.zip
+          name: llama-bin-win-cpu-x64.zip
 
   windows-rocm:
+    needs: resolve-upstream-tag
+    if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     runs-on: windows-2022
 
     strategy:
@@ -793,6 +706,7 @@ jobs:
         with:
           fetch-depth: 0
           repository: 'ggml-org/llama.cpp'
+          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
 
       - name: Cache ROCm Installation
         id: cache-rocm
@@ -883,16 +797,18 @@ jobs:
           name: llama-bin-win-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.zip
 
   windows-cuda:
-    runs-on: windows-2022
     needs:
+      - resolve-upstream-tag
       - windows-cpu
+    if: needs.resolve-upstream-tag.outputs.should_build == 'true'
+    runs-on: windows-2022
 
     strategy:
       fail-fast: false
       matrix:
         # On PRs only build one representative arch (packaging logic is identical
         # across all sm_*); build the full matrix on schedule/dispatch.
-        sm: ${{ github.event_name == 'pull_request' && fromJSON('["sm_89"]') || fromJSON('["sm_75", "sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_120", "sm_121"]') }}
+        sm: ${{ github.event_name == 'pull_request' && fromJSON('["sm_89"]') || fromJSON('["sm_70", "sm_75", "sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_120"]') }}
 
     steps:
       - name: Clone
@@ -901,6 +817,7 @@ jobs:
         with:
           fetch-depth: 0
           repository: 'ggml-org/llama.cpp'
+          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
 
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.35
@@ -1023,9 +940,11 @@ jobs:
           name: llama-windows-cuda-${{ matrix.sm }}-x64.7z
 
   windows-vulkan:
-    runs-on: windows-2022
     needs:
+      - resolve-upstream-tag
       - windows-cpu
+    if: needs.resolve-upstream-tag.outputs.should_build == 'true'
+    runs-on: windows-2022
 
     env:
       VULKAN_SDK_VERSION: "1.4.341.0"
@@ -1037,6 +956,7 @@ jobs:
         with:
           fetch-depth: 0
           repository: 'ggml-org/llama.cpp'
+          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
 
       - name: Setup Vulkan SDK
         uses: lemonade-sdk/llama.cpp/.github/actions/windows-setup-vulkan@lemonade
@@ -1131,7 +1051,7 @@ jobs:
           name: llama-bin-win-vulkan-x64.zip
 
   release:
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.create_release == 'true' }}
+    if: ${{ needs.resolve-upstream-tag.outputs.should_build == 'true' && (github.event_name == 'schedule' || github.event.inputs.create_release == 'true') }}
 
     # Fine-grant permission
     # https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
@@ -1141,13 +1061,13 @@ jobs:
     runs-on: ubuntu-slim
 
     needs:
+      - resolve-upstream-tag
       - windows-cpu
       - windows-rocm
       - windows-cuda
       - windows-vulkan
       - ubuntu-22-rocm
       - ubuntu-22-cuda
-      - ubuntu-22-cuda-arm64
       - ubuntu-22-openvino
       - ubuntu-vulkan
 
@@ -1158,10 +1078,11 @@ jobs:
         with:
           fetch-depth: 0
           repository: 'ggml-org/llama.cpp'
+          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
 
       - name: Determine tag name
         id: tag
-        uses: lemonade-sdk/llama.cpp/.github/actions/get-tag-name@lemonade
+        run: echo "name=${{ needs.resolve-upstream-tag.outputs.tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Download artifacts
         id: download-artifact
@@ -1291,7 +1212,6 @@ jobs:
                 '**Linux:**',
                 `- [Ubuntu x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz)`,
                 '- Ubuntu x64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-x64.tar.xz` (replace XX with your GPU compute capability)',
-                '- Ubuntu arm64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-arm64.tar.xz` (replace XX with your GPU compute capability)',
                 `- [Ubuntu x64 (OpenVINO 2026.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz)`,
                 '- Ubuntu x64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-x64-ubuntu-XXXX.tar.xz` (choose the matching Ubuntu version: 2204 or 2404)',
                 '',
