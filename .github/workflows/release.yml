@@ -508,6 +508,9 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    env:
+      VULKAN_SDK_VERSION: "1.4.341.0"
+
     steps:
       - name: Clone
         id: checkout
@@ -526,14 +529,24 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          # `shaderc` provides the `glslc` SPIR-V compiler on both Ubuntu 22.04
-          # (jammy) and 24.04 (noble); the standalone `glslc` package only
-          # exists on noble, so install shaderc for cross-version compatibility.
           sudo apt-get install -y build-essential cmake ninja-build patchelf \
-            libvulkan-dev shaderc spirv-headers spirv-tools
+            libvulkan-dev spirv-headers spirv-tools wget xz-utils
+
+      - name: Setup Vulkan SDK (provides glslc)
+        # The LunarG SDK supplies the `glslc` SPIR-V shader compiler. The
+        # standalone `glslc`/`shaderc` apt packages are missing from the
+        # GitHub runner's default sources on both 22.04 and 24.04, so install
+        # the SDK instead — this is version- and repo-agnostic.
+        uses: ./.github/actions/linux-setup-vulkan
+        with:
+          path: ${{ github.workspace }}/vulkansdk
+          version: ${{ env.VULKAN_SDK_VERSION }}
 
       - name: Build
+        env:
+          VULKAN_SDK: ${{ github.workspace }}/vulkansdk/x86_64
         run: |
+          export PATH="$VULKAN_SDK/bin:$PATH"
           cmake -B build -S . \
             -DGGML_VULKAN=ON \
             -DBUILD_SHARED_LIBS=ON \
