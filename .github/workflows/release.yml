@@ -987,31 +987,23 @@ jobs:
           $version = $env:VULKAN_VERSION
           $installRoot = "C:\VulkanSDK\$version"
 
-          # The Vulkan SDK installer is a Qt IFW-based installer. These flags
-          # run it fully unattended without requiring administrator elevation:
-          #   --accept-alllicenses   auto-accept every license prompt
-          #   --root                 install directory (skips the prompt for it)
-          #   --silent               no UI
-          #   --default-desktop      skip the "set as default" interactive step
-          $args = @(
-            '--accept-alllicenses',
-            '--root', $installRoot,
-            '--silent',
-            '--default-desktop'
-          )
-
           $url = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
           Write-Host "Downloading Vulkan SDK $version installer"
           Invoke-WebRequest -Uri $url -OutFile "${env:RUNNER_TEMP}\vulkansdk-installer.exe"
 
+          # The Vulkan SDK installer is Qt-IFW-based. Per LunarG's official docs,
+          # the unattended invocation is:
+          #   in --accept-licenses --confirm-command install
+          # `copy_only=1` skips the steps that need administrator privileges
+          # (Vulkan runtime/driver install) so it runs on a non-elevated runner.
           Write-Host "Installing Vulkan SDK to $installRoot"
-          $proc = Start-Process "${env:RUNNER_TEMP}\vulkansdk-installer.exe" -ArgumentList $args -NoNewWindow -PassThru
-          $completed = $proc.WaitForExit(900000) # 15 minutes
-          if (-not $completed) {
-            Write-Error "Vulkan SDK installer timed out. Killing the process."
-            $proc.Kill()
-            exit 1
-          }
+          $installerArgs = @(
+            "in", "--accept-licenses", "--default-answer", "--confirm-command",
+            "--root", "$installRoot",
+            "copy_only=1",
+            "install"
+          )
+          $proc = Start-Process "${env:RUNNER_TEMP}\vulkansdk-installer.exe" -ArgumentList $installerArgs -NoNewWindow -PassThru -Wait
           if ($proc.ExitCode -ne 0) {
             Write-Error "Vulkan SDK installer failed with exit code $($proc.ExitCode)"
             exit 1
