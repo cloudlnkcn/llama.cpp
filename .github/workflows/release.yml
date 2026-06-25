@@ -526,8 +526,11 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
+          # `shaderc` provides the `glslc` SPIR-V compiler on both Ubuntu 22.04
+          # (jammy) and 24.04 (noble); the standalone `glslc` package only
+          # exists on noble, so install shaderc for cross-version compatibility.
           sudo apt-get install -y build-essential cmake ninja-build patchelf \
-            libvulkan-dev glslc spirv-headers spirv-tools
+            libvulkan-dev shaderc spirv-headers spirv-tools
 
       - name: Build
         run: |
@@ -959,7 +962,7 @@ jobs:
           ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
 
       - name: Setup Vulkan SDK
-        uses: lemonade-sdk/llama.cpp/.github/actions/windows-setup-vulkan@lemonade
+        uses: ./.github/actions/windows-setup-vulkan
         with:
           version: ${{ env.VULKAN_SDK_VERSION }}
 
