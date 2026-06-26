@@ -226,6 +226,11 @@ jobs:
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          # Drop flaky third-party apt sources (packages.microsoft.com
+          # intermittently 403s on GitHub runners) so apt-get update can refresh
+          # Ubuntu + NVIDIA repos cleanly.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                      /etc/apt/sources.list.d/azure-cli.list 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y cuda-toolkit-12-9 cmake ninja-build patchelf
 
@@ -528,6 +533,11 @@ jobs:
 
       - name: Dependencies
         run: |
+          # Drop flaky third-party apt sources (packages.microsoft.com
+          # intermittently 403s on GitHub runners) so apt-get update succeeds;
+          # all packages we need are in Ubuntu's own main/universe repos.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                      /etc/apt/sources.list.d/azure-cli.list 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y build-essential cmake ninja-build patchelf \
             libvulkan-dev spirv-headers spirv-tools wget xz-utils
