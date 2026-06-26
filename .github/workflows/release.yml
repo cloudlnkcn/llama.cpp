@@ -85,82 +85,8 @@ jobs:
             core.setOutput('tag', tag);
             core.setOutput('should_build', String(shouldBuild));
 
-  # CPU base package: executables (llama-cli, llama-server, ...) plus every CPU
-  # backend variant, built once. The Linux GPU jobs (ROCm/CUDA/OpenVINO/Vulkan)
-  # each ship only their ggml-<backend>.so addon and rely on this package for
-  # the binaries the user actually runs — so a single download of this plus one
-  # GPU backend is a complete install, and no executables are duplicated across
-  # every GPU tarball.
-  ubuntu-cpu:
-    needs: resolve-upstream-tag
-    if: needs.resolve-upstream-tag.outputs.should_build == 'true'
-    runs-on: ubuntu-22.04
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          repository: 'ggml-org/llama.cpp'
-          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
-
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
-        with:
-          key: ubuntu-cpu-x64
-          evict-old-files: 1d
-
-      - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build libssl-dev
-
-      - name: Build
-        run: |
-          cmake -B build -S . \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DGGML_BACKEND_DL=ON \
-            -DGGML_NATIVE=OFF \
-            -DGGML_CPU_ALL_VARIANTS=ON \
-            -DGGML_OPENMP=ON \
-            ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc)
-
-      - name: Smoke test
-        run: |
-          smoke_bin="build/bin/llama-server"
-          [ -x "$smoke_bin" ] || smoke_bin="build/bin/llama-cli"
-          "$smoke_bin" --version >/dev/null
-
-      - name: Determine tag name
-        id: tag
-        uses: lemonade-sdk/llama.cpp/.github/actions/get-tag-name@lemonade
-
-      - name: Pack artifacts
-        run: |
-          cp LICENSE ./build/bin/
-          pkgdir="llama-${{ steps.tag.outputs.name }}"
-          mkdir -p "$pkgdir"
-          cp -a build/bin/. "$pkgdir/"
-          tar -czf llama-bin-ubuntu-x64.tar.gz "$pkgdir"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          path: llama-bin-ubuntu-x64.tar.gz
-          name: llama-bin-ubuntu-x64.tar.gz
-
   ubuntu-22-rocm:
-    # Sparse addon: ships only libggml-hip.so (the fat-binary ROCm backend).
-    # Executables and CPU backends come from the ubuntu-cpu base package.
-    # The build still produces a full build/bin (the ROCm/HIP toolchain drives
-    # the compiler setup), but only the backend .so is packaged.
-    needs:
-      - resolve-upstream-tag
-      - ubuntu-cpu
+    needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     runs-on: ubuntu-22.04
 
@@ -250,39 +176,11 @@ jobs:
       - name: Get ROCm short version
         run: echo "ROCM_VERSION_SHORT=$(echo '${{ matrix.ROCM_VERSION }}' | cut -d '.' -f 1,2)" >> $GITHUB_ENV
 
-      - name: Verify HIP backend was built
-        run: |
-          if ! ls build/bin/libggml-hip.so* >/dev/null 2>&1; then
-            echo "::error::libggml-hip.so was NOT produced — ROCm backend build failed"
-            exit 1
-          fi
-
-      - name: Download CPU base artifact
-        # Needed only to stage an executable for the smoke test; not packaged.
-        uses: actions/download-artifact@v7
-        with:
-          name: llama-bin-ubuntu-x64.tar.gz
-          path: ./
-
-      - name: Smoke test against staged base executable
-        # Package contains no executables; stage the base llama-server next to
-        # the freshly built libggml-hip.so and confirm it loads. Nothing staged
-        # here is uploaded.
-        run: |
-          mkdir -p smoke
-          tar -xzf llama-bin-ubuntu-x64.tar.gz -C smoke --strip-components=1
-          cp -a build/bin/libggml-hip.so* smoke/
-          LD_LIBRARY_PATH="$PWD/smoke:${LD_LIBRARY_PATH:-}" smoke/llama-server --version >/dev/null
-          rm -rf smoke llama-bin-ubuntu-x64.tar.gz
-
       - name: Pack artifacts
         id: pack_artifacts
         run: |
-          pkgdir="llama-${{ steps.tag.outputs.name }}"
-          mkdir -p "$pkgdir"
-          cp -a build/bin/libggml-hip.so* "$pkgdir/"
-          cp LICENSE "$pkgdir/"
-          tar -czf llama-bin-ubuntu-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.tar.gz "$pkgdir"
+          cp LICENSE ./build/bin/
+          tar -czvf llama-bin-ubuntu-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
@@ -291,16 +189,16 @@ jobs:
           name: llama-bin-ubuntu-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.tar.gz
 
   ubuntu-22-cuda:
-    # Sparse addon: ships only libggml-cuda.so + the CUDA runtime libs it needs.
-    # Executables and CPU backends live in the ubuntu-cpu base package, so this
-    # builds with GGML_CPU=OFF and only the ggml-cuda target — no per-sm_ split,
-    # the CUDA toolkit default architectures cover them all in one fat .so
-    # (same approach as upstream's release).
-    needs:
-      - resolve-upstream-tag
-      - ubuntu-cpu
+    needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # On PRs only build one representative arch (packaging logic is identical
+        # across all sm_*); build the full matrix on schedule/dispatch.
+        sm: ${{ github.event_name == 'pull_request' && fromJSON('["sm_89"]') || fromJSON('["sm_70", "sm_75", "sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_120"]') }}
 
     steps:
       - name: Clone
@@ -314,7 +212,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: ubuntu-cuda-x64
+          key: ubuntu-cuda-${{ matrix.sm }}
           evict-old-files: 1d
 
       - name: Free disk space
@@ -342,27 +240,30 @@ jobs:
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
-      - name: Build ggml-cuda backend
+      - name: Build
         run: |
+          cmake_arch="${{ matrix.sm }}"
+          cmake_arch="${cmake_arch#sm_}"
           cmake -B build -S . \
             -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="${cmake_arch}" \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
             -DGGML_BACKEND_DL=ON \
-            -DGGML_CPU=OFF \
             -DGGML_OPENMP=OFF \
             -DGGML_STATIC=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON \
             -DCMAKE_BUILD_TYPE=Release \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc) --target ggml-cuda
+          cmake --build build --config Release -j $(nproc)
 
       - name: Bundle CUDA runtime libraries
         run: |
           cuda_lib=/usr/local/cuda/lib64
-          cp -av ${cuda_lib}/libcudart.so*    build/bin/
-          cp -av ${cuda_lib}/libcublas.so*    build/bin/
-          cp -av ${cuda_lib}/libcublasLt.so*  build/bin/
-          cp -av ${cuda_lib}/libcurand.so*    build/bin/
+          cp -av ${cuda_lib}/libcudart.so*   build/bin/
+          cp -av ${cuda_lib}/libcublas.so*   build/bin/
+          cp -av ${cuda_lib}/libcublasLt.so* build/bin/
+          cp -av ${cuda_lib}/libcurand.so*   build/bin/
           cp -av ${cuda_lib}/libnvJitLink.so* build/bin/
 
       - name: Set RPATH for portable distribution
@@ -377,13 +278,6 @@ jobs:
       - name: Validate CUDA package contents
         run: |
           shopt -s nullglob
-
-          # ggml-cuda.so must be present — if not, the CUDA backend silently
-          # failed to build and the whole package is useless.
-          if ! ls build/bin/libggml-cuda.so* >/dev/null 2>&1; then
-            echo "::error::libggml-cuda.so was NOT produced — CUDA backend build failed"
-            exit 1
-          fi
 
           required_libs=(
             libcudart.so
@@ -400,15 +294,34 @@ jobs:
             fi
           done
 
-          for f in build/bin/libggml-cuda.so*; do
+          smoke_bin=""
+          if [ -x build/bin/llama-cli ]; then
+            smoke_bin=build/bin/llama-cli
+          elif [ -x build/bin/llama-server ]; then
+            smoke_bin=build/bin/llama-server
+          else
+            smoke_bin=$(find build/bin -maxdepth 1 -type f -name 'llama-*' -perm -111 | head -n 1)
+          fi
+
+          if [ -z "$smoke_bin" ]; then
+            echo "::error::No llama executable found for smoke testing"
+            exit 1
+          fi
+
+          "$smoke_bin" --version >/dev/null
+
+          for f in build/bin/*; do
             [ -f "$f" ] && ! [ -L "$f" ] || continue
+            if ! file "$f" | grep -q 'ELF'; then
+              continue
+            fi
+
             rpath=$(patchelf --print-rpath "$f")
             if [ "$rpath" != '$ORIGIN' ]; then
               echo "::error::Unexpected RPATH '$rpath' for $f"
               exit 1
             fi
-            # libcuda.so.1 is the userspace driver, provided by the host driver
-            # at runtime — never bundled. Treat it as resolved.
+
             missing=$(ldd "$f" | awk '/=> not found/ && $1 != "libcuda.so.1" { print }')
             if [ -n "$missing" ]; then
               echo "::error::Unresolved runtime dependencies for $f"
@@ -417,55 +330,32 @@ jobs:
             fi
           done
 
-      - name: Download CPU base artifact
-        # Needed only to stage an executable for the smoke test; not packaged.
-        uses: actions/download-artifact@v7
-        with:
-          name: llama-bin-ubuntu-x64.tar.gz
-          path: ./
-
-      - name: Smoke test against staged base executable
-        # The backend package itself contains no executables (GGML_CPU=OFF), so
-        # stage the base llama-server from the ubuntu-cpu artifact next to the
-        # freshly built libggml-cuda.so and confirm it loads. Nothing staged
-        # here ends up in the uploaded package.
-        run: |
-          mkdir -p smoke
-          tar -xzf llama-bin-ubuntu-x64.tar.gz -C smoke --strip-components=1
-          cp -a build/bin/libggml-cuda.so* smoke/
-          cp -a build/bin/libcudart.so* build/bin/libcublas.so* \
-                build/bin/libcublasLt.so* build/bin/libcurand.so* \
-                build/bin/libnvJitLink.so* smoke/ 2>/dev/null || true
-          LD_LIBRARY_PATH="$PWD/smoke:${LD_LIBRARY_PATH:-}" smoke/llama-server --version >/dev/null
-          rm -rf smoke llama-bin-ubuntu-x64.tar.gz
-
       - name: Determine tag name
         id: tag
         uses: lemonade-sdk/llama.cpp/.github/actions/get-tag-name@lemonade
 
       - name: Pack artifacts
+        id: pack_artifacts
         run: |
+          cp LICENSE ./build/bin/
+          # Stage into a versioned top-level directory so extraction lands in a
+          # single llama-<tag>/ folder, matching the ROCm Linux tarball layout.
+          # Build the directory explicitly rather than via tar --transform, which
+          # only rewrites paths when tar preserves the leading ./ on members and
+          # so behaves differently across tar versions/runners.
           pkgdir="llama-${{ steps.tag.outputs.name }}"
           mkdir -p "$pkgdir"
-          cp -a build/bin/libggml-cuda.so* "$pkgdir/"
-          cp -a build/bin/libcudart.so* build/bin/libcublas.so* \
-                build/bin/libcublasLt.so* build/bin/libcurand.so* \
-                build/bin/libnvJitLink.so* "$pkgdir/" 2>/dev/null || true
-          cp LICENSE "$pkgdir/"
-          tar -cJf llama-ubuntu-cuda-x64.tar.xz "$pkgdir"
+          cp -a build/bin/. "$pkgdir/"
+          tar -cJf llama-ubuntu-cuda-${{ matrix.sm }}-x64.tar.xz "$pkgdir"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-ubuntu-cuda-x64.tar.xz
-          name: llama-ubuntu-cuda-x64.tar.xz
+          path: llama-ubuntu-cuda-${{ matrix.sm }}-x64.tar.xz
+          name: llama-ubuntu-cuda-${{ matrix.sm }}-x64.tar.xz
 
   ubuntu-22-openvino:
-    # Sparse addon: ships only libggml-openvino.so + the OpenVINO runtime/TBB
-    # libs. Executables and CPU backends come from the ubuntu-cpu base package.
-    needs:
-      - resolve-upstream-tag
-      - ubuntu-cpu
+    needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     runs-on: ubuntu-22.04
 
@@ -506,7 +396,7 @@ jobs:
           chmod +x ${{ github.workspace }}/openvino/install_dependencies/install_openvino_dependencies.sh
           echo "Y" | sudo -E ${{ github.workspace }}/openvino/install_dependencies/install_openvino_dependencies.sh
 
-      - name: Build ggml-openvino backend
+      - name: Build
         run: |
           source ${{ github.workspace }}/openvino/setupvars.sh
           cmake -B build -S . \
@@ -514,12 +404,12 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
             -DGGML_BACKEND_DL=ON \
-            -DGGML_CPU=OFF \
             -DGGML_OPENMP=OFF \
             -DGGML_STATIC=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON \
             -DCMAKE_BUILD_TYPE=Release \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc) --target ggml-openvino
+          cmake --build build --config Release -j $(nproc)
 
       - name: Bundle OpenVINO runtime libraries
         run: |
@@ -548,11 +438,6 @@ jobs:
         run: |
           shopt -s nullglob
 
-          if ! ls build/bin/libggml-openvino.so* >/dev/null 2>&1; then
-            echo "::error::libggml-openvino.so was NOT produced — OpenVINO backend build failed"
-            exit 1
-          fi
-
           required_libs=(libopenvino.so)
           for lib in "${required_libs[@]}"; do
             matches=(build/bin/${lib}*)
@@ -562,13 +447,30 @@ jobs:
             fi
           done
 
-          for f in build/bin/libggml-openvino.so*; do
+          smoke_bin=""
+          if [ -x build/bin/llama-server ]; then
+            smoke_bin=build/bin/llama-server
+          else
+            smoke_bin=$(find build/bin -maxdepth 1 -type f -name 'llama-*' -perm -111 | head -n 1)
+          fi
+          if [ -z "$smoke_bin" ]; then
+            echo "::error::No llama executable found for smoke testing"
+            exit 1
+          fi
+          "$smoke_bin" --version >/dev/null
+
+          for f in build/bin/*; do
             [ -f "$f" ] && ! [ -L "$f" ] || continue
+            if ! file "$f" | grep -q 'ELF'; then
+              continue
+            fi
+
             rpath=$(patchelf --print-rpath "$f")
             if [ "$rpath" != '$ORIGIN' ]; then
               echo "::error::Unexpected RPATH '$rpath' for $f"
               exit 1
             fi
+
             # libOpenCL is optional (Intel GPU acceleration); skip it
             missing=$(ldd "$f" | awk '/=> not found/ && $1 != "libOpenCL.so.1" { print }')
             if [ -n "$missing" ]; then
@@ -578,36 +480,16 @@ jobs:
             fi
           done
 
-      - name: Download CPU base artifact
-        # Needed only to stage an executable for the smoke test; not packaged.
-        uses: actions/download-artifact@v7
-        with:
-          name: llama-bin-ubuntu-x64.tar.gz
-          path: ./
-
-      - name: Smoke test against staged base executable
-        run: |
-          mkdir -p smoke
-          tar -xzf llama-bin-ubuntu-x64.tar.gz -C smoke --strip-components=1
-          cp -a build/bin/libggml-openvino.so* smoke/
-          cp -a build/bin/libopenvino*.so* smoke/ 2>/dev/null || true
-          cp -a build/bin/libtbb.so* build/bin/libtbbmalloc.so* smoke/ 2>/dev/null || true
-          LD_LIBRARY_PATH="$PWD/smoke:${LD_LIBRARY_PATH:-}" smoke/llama-server --version >/dev/null
-          rm -rf smoke llama-bin-ubuntu-x64.tar.gz
-
       - name: Determine tag name
         id: tag
         uses: lemonade-sdk/llama.cpp/.github/actions/get-tag-name@lemonade
 
       - name: Pack artifacts
         run: |
-          pkgdir="llama-${{ steps.tag.outputs.name }}"
-          mkdir -p "$pkgdir"
-          cp -a build/bin/libggml-openvino.so* "$pkgdir/"
-          cp -a build/bin/libopenvino*.so* "$pkgdir/" 2>/dev/null || true
-          cp -a build/bin/libtbb.so* build/bin/libtbbmalloc.so* "$pkgdir/" 2>/dev/null || true
-          cp LICENSE "$pkgdir/"
-          tar -czf llama-bin-ubuntu-openvino-${{ env.OPENVINO_VERSION_MAJOR }}-x64.tar.gz "$pkgdir"
+          cp LICENSE ./build/bin/
+          tar -czvf llama-bin-ubuntu-openvino-${{ env.OPENVINO_VERSION_MAJOR }}-x64.tar.gz \
+            --transform "s,./,llama-${{ steps.tag.outputs.name }}/," \
+            -C ./build/bin .
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
@@ -616,11 +498,7 @@ jobs:
           name: llama-bin-ubuntu-openvino-${{ env.OPENVINO_VERSION_MAJOR }}-x64.tar.gz
 
   ubuntu-vulkan:
-    # Sparse addon: ships only libggml-vulkan.so (+ libggml.so it links against).
-    # Executables and CPU backends come from the ubuntu-cpu base package.
-    needs:
-      - resolve-upstream-tag
-      - ubuntu-cpu
+    needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     strategy:
       fail-fast: false
@@ -674,7 +552,7 @@ jobs:
           path: ${{ github.workspace }}/vulkansdk
           version: ${{ env.VULKAN_SDK_VERSION }}
 
-      - name: Build ggml-vulkan backend
+      - name: Build
         env:
           VULKAN_SDK: ${{ github.workspace }}/vulkansdk/x86_64
         run: |
@@ -684,12 +562,12 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
             -DGGML_BACKEND_DL=ON \
-            -DGGML_CPU=OFF \
             -DGGML_OPENMP=OFF \
             -DGGML_STATIC=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON \
             -DCMAKE_BUILD_TYPE=Release \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc) --target ggml-vulkan
+          cmake --build build --config Release -j $(nproc)
 
       - name: Set RPATH for portable distribution
         run: |
@@ -713,13 +591,30 @@ jobs:
             fi
           done
 
-          for f in build/bin/libggml-vulkan.so* build/bin/libggml.so*; do
+          smoke_bin=""
+          if [ -x build/bin/llama-server ]; then
+            smoke_bin=build/bin/llama-server
+          else
+            smoke_bin=$(find build/bin -maxdepth 1 -type f -name 'llama-*' -perm -111 | head -n 1)
+          fi
+          if [ -z "$smoke_bin" ]; then
+            echo "::error::No llama executable found for smoke testing"
+            exit 1
+          fi
+          "$smoke_bin" --version >/dev/null
+
+          for f in build/bin/*; do
             [ -f "$f" ] && ! [ -L "$f" ] || continue
+            if ! file "$f" | grep -q 'ELF'; then
+              continue
+            fi
+
             rpath=$(patchelf --print-rpath "$f")
             if [ "$rpath" != '$ORIGIN' ]; then
               echo "::error::Unexpected RPATH '$rpath' for $f"
               exit 1
             fi
+
             # libvulkan.so.1 is the system Vulkan loader, provided by the GPU
             # driver at runtime — never bundle it. Treat it as resolved.
             missing=$(ldd "$f" | awk '/=> not found/ && $1 != "libvulkan.so.1" { print }')
@@ -730,31 +625,18 @@ jobs:
             fi
           done
 
-      - name: Download CPU base artifact
-        # Needed only to stage an executable for the smoke test; not packaged.
-        uses: actions/download-artifact@v7
-        with:
-          name: llama-bin-ubuntu-x64.tar.gz
-          path: ./
-
-      - name: Smoke test against staged base executable
-        run: |
-          mkdir -p smoke
-          tar -xzf llama-bin-ubuntu-x64.tar.gz -C smoke --strip-components=1
-          cp -a build/bin/libggml-vulkan.so* build/bin/libggml.so* smoke/
-          LD_LIBRARY_PATH="$PWD/smoke:${LD_LIBRARY_PATH:-}" smoke/llama-server --version >/dev/null
-          rm -rf smoke llama-bin-ubuntu-x64.tar.gz
-
       - name: Determine tag name
         id: tag
         uses: lemonade-sdk/llama.cpp/.github/actions/get-tag-name@lemonade
 
       - name: Pack artifacts
         run: |
+          cp LICENSE ./build/bin/
+          # Stage into a versioned top-level directory so extraction lands in a
+          # single llama-<tag>/ folder, matching the CUDA Linux tarball layout.
           pkgdir="llama-${{ steps.tag.outputs.name }}"
           mkdir -p "$pkgdir"
-          cp -a build/bin/libggml-vulkan.so* build/bin/libggml.so* "$pkgdir/"
-          cp LICENSE "$pkgdir/"
+          cp -a build/bin/. "$pkgdir/"
           tar -cJf llama-ubuntu-vulkan-x64-ubuntu-${{ matrix.ubuntu_version }}.tar.xz "$pkgdir"
 
       - name: Upload artifacts
@@ -832,11 +714,7 @@ jobs:
           name: llama-bin-win-cpu-x64.zip
 
   windows-rocm:
-    # Sparse addon: ships only ggml-hip.dll (the fat-binary ROCm backend).
-    # Executables and CPU backends come from the windows-cpu base zip.
-    needs:
-      - resolve-upstream-tag
-      - windows-cpu
+    needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     runs-on: windows-2022
 
@@ -890,7 +768,7 @@ jobs:
           echo "$rocmPath\bin" >> $env:GITHUB_PATH
           echo "$rocmPath\lib\llvm\bin" >> $env:GITHUB_PATH
 
-      - name: Build ggml-hip backend
+      - name: Build
         run: |
           mkdir build
           cd build
@@ -900,7 +778,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DGGML_BACKEND_DL=ON `
             -DGGML_NATIVE=OFF `
-            -DGGML_CPU=OFF `
+            -DGGML_CPU=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
             -DGGML_HIP=ON `
             -DCMAKE_C_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
             -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang++.exe" `
@@ -909,58 +788,19 @@ jobs:
             -DHIP_PATH="${env:HIP_PATH}" `
             -DGGML_HIP_ROCWMMA_FATTN=ON `
             -DAMDGPU_TARGETS="${{ matrix.gpu_targets }}"
-          cmake --build . --config Release --target ggml-hip --parallel ${env:NUMBER_OF_PROCESSORS}
+          cmake --build . --config Release --parallel ${env:NUMBER_OF_PROCESSORS}
 
       - name: Verify HIP backend was built
         run: |
-          $hipDll = Get-ChildItem -Path build\bin\Release -Filter "ggml-hip*.dll" -ErrorAction SilentlyContinue
-          if (-not $hipDll) {
-            $hipDll = Get-ChildItem -Path build\bin -Filter "ggml-hip*.dll" -ErrorAction SilentlyContinue
-          }
+          $hipDll = Get-ChildItem -Path build\bin -Filter "ggml-hip*.dll" -ErrorAction SilentlyContinue
           if (-not $hipDll) {
             Write-Host "##[error]ggml-hip*.dll was NOT produced. The HIP backend silently failed to build."
             Write-Host "Contents of build\bin:"
-            Get-ChildItem build\bin -Recurse -ErrorAction SilentlyContinue | Format-Table -AutoSize
+            Get-ChildItem build\bin | Format-Table -AutoSize
             exit 1
           }
-          echo "HIP_BACKEND=$($hipDll.FullName)" >> $env:GITHUB_ENV
           Write-Host "HIP backend artifact found:"
           $hipDll | Format-Table FullName, Length -AutoSize
-
-      - name: Download CPU backend artifact
-        uses: actions/download-artifact@v7
-        with:
-          name: llama-bin-win-cpu-x64.zip
-          path: .\cpu-artifact
-
-      - name: Smoke test against staged base executable
-        run: |
-          $cpuArchive = '.\cpu-artifact\llama-bin-win-cpu-x64.zip'
-          if (-not (Test-Path $cpuArchive)) {
-            throw "Missing required CPU backend artifact: $cpuArchive"
-          }
-          $smokeDir = Join-Path $env:RUNNER_TEMP 'rocm-smoke'
-          if (Test-Path $smokeDir) { Remove-Item $smokeDir -Recurse -Force }
-          New-Item -ItemType Directory -Path $smokeDir | Out-Null
-          Expand-Archive -Path $cpuArchive -DestinationPath $smokeDir -Force
-          Copy-Item $env:HIP_BACKEND $smokeDir -Force
-
-          $smokeExe = $null
-          foreach ($name in @('llama-cli.exe', 'llama-server.exe')) {
-            $candidate = Get-ChildItem -Path $smokeDir -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($candidate) { $smokeExe = $candidate; break }
-          }
-          if (-not $smokeExe) {
-            throw "No llama executable found for staged Windows ROCm smoke test"
-          }
-          Push-Location $smokeDir
-          try {
-            & ".\$($smokeExe.Name)" --version | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-              throw "Smoke test failed for $($smokeExe.Name) with exit code $LASTEXITCODE"
-            }
-          }
-          finally { Pop-Location }
 
       - name: Determine tag name
         id: tag
@@ -973,11 +813,8 @@ jobs:
 
       - name: Pack artifacts
         run: |
-          $staging = Join-Path $env:RUNNER_TEMP 'rocm-pkg'
-          New-Item -ItemType Directory -Path $staging -Force | Out-Null
-          Copy-Item $env:HIP_BACKEND $staging
-          Copy-Item LICENSE $staging
-          7z a -snl llama-bin-win-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.zip "$staging\\*"
+          cp "LICENSE" "build\bin\"
+          7z a -snl llama-bin-win-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.zip .\build\bin\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
@@ -986,15 +823,18 @@ jobs:
           name: llama-bin-win-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.zip
 
   windows-cuda:
-    # Sparse addon: ships only ggml-cuda.dll + the CUDA runtime DLLs it needs.
-    # Executables and CPU backends come from the windows-cpu base zip. No
-    # per-sm_ split — the CUDA toolkit default architectures cover them all in
-    # one fat ggml-cuda.dll (matches upstream's release).
     needs:
       - resolve-upstream-tag
       - windows-cpu
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
     runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # On PRs only build one representative arch (packaging logic is identical
+        # across all sm_*); build the full matrix on schedule/dispatch.
+        sm: ${{ github.event_name == 'pull_request' && fromJSON('["sm_89"]') || fromJSON('["sm_70", "sm_75", "sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_120"]') }}
 
     steps:
       - name: Clone
@@ -1015,43 +855,50 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: windows-cuda-x64
+          key: windows-cuda-${{ matrix.sm }}
           variant: ccache
           evict-old-files: 1d
 
       - name: Install Ninja
         run: choco install ninja
 
-      - name: Build ggml-cuda backend
+      - name: Build
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          set sm=${{ matrix.sm }}
+          set cmake_arch=%sm:sm_=%
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=%cmake_arch% ^
             -DGGML_NATIVE=OFF ^
             -DGGML_BACKEND_DL=ON ^
-            -DGGML_CPU=OFF ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release --target ggml-cuda
+          cmake --build build --config Release
 
-      - name: Stage sparse package
-        # Collect only ggml-cuda.dll + the CUDA runtime DLLs into a staging dir.
-        # The CPU zip is downloaded next purely for the smoke test; it is NOT
-        # merged into this package.
+      - name: Download CPU backend artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: llama-bin-win-cpu-x64.zip
+          path: .\cpu-artifact
+
+      - name: Pack artifacts
         run: |
           $releaseDir = '.\build\bin\Release'
+          $cpuArchive = '.\cpu-artifact\llama-bin-win-cpu-x64.zip'
           $cudaBin = Join-Path $env:CUDA_PATH 'bin'
-          $staging = Join-Path $env:RUNNER_TEMP 'cuda-pkg'
-          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          $cpuExtractDir = Join-Path $env:RUNNER_TEMP "cpu-backend-${{ matrix.sm }}"
 
-          $cudaDll = Get-ChildItem -Path $releaseDir -Filter "ggml-cuda*.dll" -ErrorAction SilentlyContinue
-          if (-not $cudaDll) {
-            Write-Host "##[error]ggml-cuda*.dll was NOT produced — CUDA backend build failed."
-            Get-ChildItem $releaseDir -ErrorAction SilentlyContinue | Format-Table -AutoSize
-            exit 1
+          if (-not (Test-Path $cpuArchive)) {
+            throw "Missing required CPU backend artifact: $cpuArchive"
           }
-          Copy-Item $cudaDll.FullName $staging
+          if (Test-Path $cpuExtractDir) {
+            Remove-Item $cpuExtractDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $cpuExtractDir | Out-Null
+          Expand-Archive -Path $cpuArchive -DestinationPath $cpuExtractDir -Force
+          Copy-Item (Join-Path $cpuExtractDir '*') $releaseDir -Recurse -Force
 
           $runtimeDllPatterns = @(
             'cudart64_*.dll',
@@ -1065,58 +912,58 @@ jobs:
             if (-not $dll) {
               throw "Missing CUDA runtime DLL matching $pattern in $cudaBin"
             }
-            Copy-Item $dll.FullName $staging
+            Copy-Item $dll.FullName $releaseDir
           }
-          Copy-Item LICENSE $staging
+          Copy-Item LICENSE $releaseDir
 
-          # Persist the staging path for the smoke + pack steps.
-          echo "STAGING=$staging" >> $env:GITHUB_ENV
-
-      - name: Download CPU backend artifact
-        uses: actions/download-artifact@v7
-        with:
-          name: llama-bin-win-cpu-x64.zip
-          path: .\cpu-artifact
-
-      - name: Smoke test against staged base executable
-        run: |
-          $cpuArchive = '.\cpu-artifact\llama-bin-win-cpu-x64.zip'
-          if (-not (Test-Path $cpuArchive)) {
-            throw "Missing required CPU backend artifact: $cpuArchive"
+          $cudaDll = Get-ChildItem -Path $releaseDir -Filter "ggml-cuda*.dll" -ErrorAction SilentlyContinue
+          if (-not $cudaDll) {
+            Write-Host "##[error]ggml-cuda*.dll was NOT produced in the final package layout."
+            Write-Host "Contents of ${releaseDir}:"
+            Get-ChildItem $releaseDir | Format-Table -AutoSize
+            exit 1
           }
-          $smokeDir = Join-Path $env:RUNNER_TEMP 'cuda-smoke'
-          if (Test-Path $smokeDir) { Remove-Item $smokeDir -Recurse -Force }
-          New-Item -ItemType Directory -Path $smokeDir | Out-Null
-          Expand-Archive -Path $cpuArchive -DestinationPath $smokeDir -Force
-          # Drop the freshly built ggml-cuda.dll + runtime next to the base exe.
-          Copy-Item (Join-Path $env:STAGING '*') $smokeDir -Force
+
+          foreach ($pattern in $runtimeDllPatterns) {
+            $dll = Get-ChildItem -Path $releaseDir -Filter $pattern | Select-Object -First 1
+            if (-not $dll) {
+              throw "Missing staged CUDA runtime DLL matching $pattern in $releaseDir"
+            }
+          }
 
           $smokeExe = $null
           foreach ($name in @('llama-cli.exe', 'llama-server.exe')) {
-            $candidate = Get-ChildItem -Path $smokeDir -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($candidate) { $smokeExe = $candidate; break }
+            $candidate = Get-ChildItem -Path $releaseDir -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($candidate) {
+              $smokeExe = $candidate
+              break
+            }
+          }
+          if (-not $smokeExe) {
+            $smokeExe = Get-ChildItem -Path $releaseDir -Filter 'llama-*.exe' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -First 1
           }
           if (-not $smokeExe) {
             throw "No llama executable found for staged Windows CUDA smoke test"
           }
-          Push-Location $smokeDir
+
+          Push-Location $releaseDir
           try {
             & ".\$($smokeExe.Name)" --version | Out-Null
             if ($LASTEXITCODE -ne 0) {
               throw "Smoke test failed for $($smokeExe.Name) with exit code $LASTEXITCODE"
             }
           }
-          finally { Pop-Location }
+          finally {
+            Pop-Location
+          }
 
-      - name: Pack artifacts
-        run: |
-          7z a -snl llama-windows-cuda-x64.7z "$env:STAGING\\*"
+          7z a -snl llama-windows-cuda-${{ matrix.sm }}-x64.7z "$releaseDir\\*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-windows-cuda-x64.7z
-          name: llama-windows-cuda-x64.7z
+          path: llama-windows-cuda-${{ matrix.sm }}-x64.7z
+          name: llama-windows-cuda-${{ matrix.sm }}-x64.7z
 
   windows-vulkan:
     needs:
@@ -1212,7 +1059,7 @@ jobs:
       - name: Install Ninja
         run: choco install ninja
 
-      - name: Build ggml-vulkan backend
+      - name: Build
         shell: cmd
         env:
           VULKAN_SDK: C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}
@@ -1223,34 +1070,9 @@ jobs:
             -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%\spirv-headers-install;C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_BACKEND_DL=ON ^
-            -DGGML_CPU=OFF ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release --target ggml-vulkan
-
-      - name: Stage sparse package
-        # Collect only the Vulkan backend (+ ggml.dll it links against) into a
-        # staging dir. The CPU zip is downloaded next purely for the smoke test;
-        # it is NOT merged into this package.
-        run: |
-          $releaseDir = '.\build\bin\Release'
-          $staging = Join-Path $env:RUNNER_TEMP 'vulkan-pkg'
-          New-Item -ItemType Directory -Path $staging -Force | Out-Null
-
-          $vulkanDll = Get-ChildItem -Path $releaseDir -Filter "ggml-vulkan*.dll" -ErrorAction SilentlyContinue
-          if (-not $vulkanDll) {
-            Write-Host "##[error]ggml-vulkan*.dll was NOT produced — Vulkan backend build failed."
-            Get-ChildItem $releaseDir -ErrorAction SilentlyContinue | Format-Table -AutoSize
-            exit 1
-          }
-          Copy-Item $vulkanDll.FullName $staging
-          # ggml.dll is the core lib the backend links against; ship it too.
-          Get-ChildItem -Path $releaseDir -Filter 'ggml*.dll' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -notlike 'ggml-vulkan*' } |
-            ForEach-Object { Copy-Item $_.FullName $staging }
-          Copy-Item LICENSE $staging
-
-          echo "STAGING=$staging" >> $env:GITHUB_ENV
+          cmake --build build --config Release
 
       - name: Download CPU backend artifact
         uses: actions/download-artifact@v7
@@ -1258,38 +1080,58 @@ jobs:
           name: llama-bin-win-cpu-x64.zip
           path: .\cpu-artifact
 
-      - name: Smoke test against staged base executable
+      - name: Pack artifacts
         run: |
+          $releaseDir = '.\build\bin\Release'
           $cpuArchive = '.\cpu-artifact\llama-bin-win-cpu-x64.zip'
+          $cpuExtractDir = Join-Path $env:RUNNER_TEMP "cpu-backend-vulkan"
+
           if (-not (Test-Path $cpuArchive)) {
             throw "Missing required CPU backend artifact: $cpuArchive"
           }
-          $smokeDir = Join-Path $env:RUNNER_TEMP 'vulkan-smoke'
-          if (Test-Path $smokeDir) { Remove-Item $smokeDir -Recurse -Force }
-          New-Item -ItemType Directory -Path $smokeDir | Out-Null
-          Expand-Archive -Path $cpuArchive -DestinationPath $smokeDir -Force
-          Copy-Item (Join-Path $env:STAGING '*') $smokeDir -Force
+          if (Test-Path $cpuExtractDir) {
+            Remove-Item $cpuExtractDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $cpuExtractDir | Out-Null
+          Expand-Archive -Path $cpuArchive -DestinationPath $cpuExtractDir -Force
+          Copy-Item (Join-Path $cpuExtractDir '*') $releaseDir -Recurse -Force
+          Copy-Item LICENSE $releaseDir
+
+          $vulkanDll = Get-ChildItem -Path $releaseDir -Filter "ggml-vulkan*.dll" -ErrorAction SilentlyContinue
+          if (-not $vulkanDll) {
+            Write-Host "##[error]ggml-vulkan*.dll was NOT produced in the final package layout."
+            Write-Host "Contents of ${releaseDir}:"
+            Get-ChildItem $releaseDir | Format-Table -AutoSize
+            exit 1
+          }
 
           $smokeExe = $null
           foreach ($name in @('llama-cli.exe', 'llama-server.exe')) {
-            $candidate = Get-ChildItem -Path $smokeDir -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($candidate) { $smokeExe = $candidate; break }
+            $candidate = Get-ChildItem -Path $releaseDir -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($candidate) {
+              $smokeExe = $candidate
+              break
+            }
+          }
+          if (-not $smokeExe) {
+            $smokeExe = Get-ChildItem -Path $releaseDir -Filter 'llama-*.exe' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -First 1
           }
           if (-not $smokeExe) {
             throw "No llama executable found for staged Windows Vulkan smoke test"
           }
-          Push-Location $smokeDir
+
+          Push-Location $releaseDir
           try {
             & ".\$($smokeExe.Name)" --version | Out-Null
             if ($LASTEXITCODE -ne 0) {
               throw "Smoke test failed for $($smokeExe.Name) with exit code $LASTEXITCODE"
             }
           }
-          finally { Pop-Location }
+          finally {
+            Pop-Location
+          }
 
-      - name: Pack artifacts
-        run: |
-          7z a -snl llama-bin-win-vulkan-x64.zip "$env:STAGING\\*"
+          7z a -snl llama-bin-win-vulkan-x64.zip "$releaseDir\\*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
@@ -1313,7 +1155,6 @@ jobs:
       - windows-rocm
       - windows-cuda
       - windows-vulkan
-      - ubuntu-cpu
       - ubuntu-22-rocm
       - ubuntu-22-cuda
       - ubuntu-22-openvino
@@ -1344,9 +1185,29 @@ jobs:
         run: |
           mkdir -p release
 
-          # GPU packages are shipped sparse (backend .dll/.so only); the CPU
-          # package carries the executables. Do NOT merge CPU files back into
-          # the GPU archives — that would re-bloat every package.
+          echo "Adding CPU backend files to Windows ZIP archives..."
+          for arch in x64; do
+            cpu_zip="artifact/llama-bin-win-cpu-${arch}.zip"
+            if [ ! -f "$cpu_zip" ]; then
+              echo "::error::Missing required CPU artifact $cpu_zip"
+              exit 1
+            fi
+            temp_dir=$(mktemp -d)
+            echo "Extracting CPU backend for $arch..."
+            unzip "$cpu_zip" -d "$temp_dir"
+
+            echo "Adding CPU files to $arch zips..."
+            for target_zip in artifact/llama-bin-win-*-${arch}.zip; do
+              if [[ "$target_zip" == "$cpu_zip" ]]; then
+                continue
+              fi
+              echo "Adding CPU backend to $(basename "$target_zip")"
+              realpath_target_zip=$(realpath "$target_zip")
+              (cd "$temp_dir" && zip -r "$realpath_target_zip" .)
+            done
+
+            rm -rf "$temp_dir"
+          done
 
           echo "Renaming and moving zips to release..."
           for zip_file in artifact/llama-bin-win-*.zip; do
@@ -1437,20 +1298,16 @@ jobs:
                 '',
                 '</details>',
                 '',
-                '> **Install:** download the **base package** for your platform (it has the executables + CPU backend), then the **one GPU backend** that matches your hardware. Extract both into the same folder.',
-                '',
-                '**Linux (Ubuntu):**',
-                `- [Base (CPU, executables + CPU backends)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-x64.tar.gz)`,
-                `- [GPU backend — ROCm 7.13](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz)`,
-                `- [GPU backend — CUDA 12.9](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-ubuntu-cuda-x64.tar.xz)`,
-                `- [GPU backend — OpenVINO 2026.0](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz)`,
-                '- GPU backend — Vulkan: `llama-' + tag + '-ubuntu-vulkan-x64-ubuntu-XXXX.tar.xz` (choose the matching Ubuntu version: 2204 or 2404)',
+                '**Linux:**',
+                `- [Ubuntu x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz)`,
+                '- Ubuntu x64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-x64.tar.xz` (replace XX with your GPU compute capability)',
+                `- [Ubuntu x64 (OpenVINO 2026.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz)`,
+                '- Ubuntu x64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-x64-ubuntu-XXXX.tar.xz` (choose the matching Ubuntu version: 2204 or 2404)',
                 '',
                 '**Windows:**',
-                `- [Base (CPU, executables + CPU backends)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-cpu-x64.zip)`,
-                `- [GPU backend — ROCm 7.13](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-rocm-7.13-x64.zip)`,
-                `- [GPU backend — CUDA 12.9](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-windows-cuda-x64.7z)`,
-                `- [GPU backend — Vulkan 1.4.309.0](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-vulkan-x64.zip)`,
+                `- [Windows x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-rocm-7.13-x64.zip)`,
+                '- Windows x64 (CUDA): `llama-' + tag + '-windows-cuda-sm_XX-x64.7z` (replace XX with your GPU compute capability)',
+                `- [Windows x64 (Vulkan 1.4.309.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-vulkan-x64.zip)`,
               ].join('\n');
               try {
                 release = (await github.rest.repos.createRelease({ owner, repo, tag_name: tag, body })).data;
