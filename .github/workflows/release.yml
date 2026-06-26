@@ -85,6 +85,73 @@ jobs:
             core.setOutput('tag', tag);
             core.setOutput('should_build', String(shouldBuild));
 
+  # Standalone pure-CPU Linux package: executables + every CPU SIMD variant
+  # (sse/avx/avx2/avx512) so the best one is picked at runtime for full CPU
+  # inference performance. This is the Linux counterpart to windows-cpu.
+  # GPU packages keep their CPU fallback single-variant for size; this package
+  # exists specifically for CPU-only use, so variants stay on.
+  ubuntu-cpu:
+    needs: resolve-upstream-tag
+    if: needs.resolve-upstream-tag.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          repository: 'ggml-org/llama.cpp'
+          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: ubuntu-cpu-x64
+          evict-old-files: 1d
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build libssl-dev
+
+      - name: Build
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_OPENMP=ON \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Smoke test
+        run: |
+          smoke_bin="build/bin/llama-server"
+          [ -x "$smoke_bin" ] || smoke_bin="build/bin/llama-cli"
+          "$smoke_bin" --version >/dev/null
+
+      - name: Determine tag name
+        id: tag
+        uses: lemonade-sdk/llama.cpp/.github/actions/get-tag-name@lemonade
+
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          pkgdir="llama-${{ steps.tag.outputs.name }}"
+          mkdir -p "$pkgdir"
+          cp -a build/bin/. "$pkgdir/"
+          tar -czf llama-bin-ubuntu-x64.tar.gz "$pkgdir"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-ubuntu-x64.tar.gz
+          name: llama-bin-ubuntu-x64.tar.gz
+
   ubuntu-22-rocm:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
@@ -679,7 +746,7 @@ jobs:
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DGGML_NATIVE=OFF ^
             -DGGML_BACKEND_DL=ON ^
-            -DGGML_CPU_ALL_VARIANTS=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
             -DGGML_OPENMP=ON ^
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release
@@ -1155,6 +1222,7 @@ jobs:
       - windows-rocm
       - windows-cuda
       - windows-vulkan
+      - ubuntu-cpu
       - ubuntu-22-rocm
       - ubuntu-22-cuda
       - ubuntu-22-openvino
@@ -1299,6 +1367,7 @@ jobs:
                 '</details>',
                 '',
                 '**Linux:**',
+                `- [Ubuntu x64 (CPU)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-x64.tar.gz)`,
                 `- [Ubuntu x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz)`,
                 '- Ubuntu x64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-x64.tar.xz` (replace XX with your GPU compute capability)',
                 `- [Ubuntu x64 (OpenVINO 2026.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz)`,
