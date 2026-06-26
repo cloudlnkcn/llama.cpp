@@ -1032,13 +1032,22 @@ jobs:
         # The LunarG Vulkan SDK does NOT ship SPIRV-HeadersConfig.cmake (its
         # `share/cmake` only covers SDL2/SDL3), but ggml-vulkan's CMakeLists
         # calls find_package(SPIRV-Headers CONFIG REQUIRED). Install Khronos's
-        # header-only SPIRV-Headers separately and export SPIRV-Headers_DIR.
-        shell: cmd
+        # header-only SPIRV-Headers at the tag matching the SDK version.
+        shell: pwsh
+        env:
+          VULKAN_VERSION: ${{ env.VULKAN_SDK_VERSION }}
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git C:\spirv-headers-src
-          cmake -S C:\spirv-headers-src -B C:\spirv-headers-build -DCMAKE_INSTALL_PREFIX=C:\spirv-headers
-          cmake --build C:\spirv-headers-build --target install --config Release
+          $ErrorActionPreference = "Stop"
+          $tag = "vulkan-sdk-$($env:VULKAN_VERSION)"
+          git clone --depth 1 -b $tag https://github.com/KhronosGroup/SPIRV-Headers.git "$env:GITHUB_WORKSPACE\spirv-headers-src"
+          cmake -S "$env:GITHUB_WORKSPACE\spirv-headers-src" `
+                -B "$env:GITHUB_WORKSPACE\spirv-headers-build" `
+                -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE\spirv-headers-install"
+          cmake --build "$env:GITHUB_WORKSPACE\spirv-headers-build" --target install --config Release
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE\spirv-headers-install\share\cmake\SPIRV-Headers\SPIRV-HeadersConfig.cmake")) {
+            Write-Error "SPIRV-HeadersConfig.cmake not found after install"
+            exit 1
+          }
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -1058,8 +1067,7 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_VULKAN=ON ^
-            -DCMAKE_PREFIX_PATH="C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}" ^
-            -DSPIRV-Headers_DIR="C:\spirv-headers\share\cmake\SPIRV-Headers" ^
+            -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%\spirv-headers-install;C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_BACKEND_DL=ON ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
