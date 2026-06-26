@@ -999,7 +999,7 @@ jobs:
           Write-Host "Installing Vulkan SDK to $installRoot"
           $installerArgs = @(
             '--accept-licenses', '--default-answer', '--confirm-command',
-            '--root', "`"$installRoot`"",
+            '--root', $installRoot,
             'install',
             'copy_only=1'
           )
