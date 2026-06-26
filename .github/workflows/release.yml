@@ -1028,6 +1028,18 @@ jobs:
           echo "VULKAN_SDK=$installRoot" >> $env:GITHUB_ENV
           echo "$installRoot\Bin" >> $env:GITHUB_PATH
 
+      - name: Setup SPIRV-Headers
+        # The LunarG Vulkan SDK does NOT ship SPIRV-HeadersConfig.cmake (its
+        # `share/cmake` only covers SDL2/SDL3), but ggml-vulkan's CMakeLists
+        # calls find_package(SPIRV-Headers CONFIG REQUIRED). Install Khronos's
+        # header-only SPIRV-Headers separately and export SPIRV-Headers_DIR.
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git C:\spirv-headers-src
+          cmake -S C:\spirv-headers-src -B C:\spirv-headers-build -DCMAKE_INSTALL_PREFIX=C:\spirv-headers
+          cmake --build C:\spirv-headers-build --target install --config Release
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
@@ -1047,6 +1059,7 @@ jobs:
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_VULKAN=ON ^
             -DCMAKE_PREFIX_PATH="C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}" ^
+            -DSPIRV-Headers_DIR="C:\spirv-headers\share\cmake\SPIRV-Headers" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_BACKEND_DL=ON ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
