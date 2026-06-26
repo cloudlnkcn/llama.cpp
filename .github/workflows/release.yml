@@ -1030,10 +1030,13 @@ jobs:
 
       - name: Build
         shell: cmd
+        env:
+          VULKAN_SDK: C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_VULKAN=ON ^
+            -DCMAKE_PREFIX_PATH="C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_BACKEND_DL=ON ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
