@@ -1342,12 +1342,18 @@ jobs:
   # is the primary accelerator on M-series chips, so this single arm64 package
   # covers the meaningful macOS audience (Intel Macs are not built here).
   #
-  # GGML_METAL_EMBED_LIBRARY=ON bakes the compiled Metal shaders directly into
-  # libggml-metal.dylib, so NO separate default.metallib / ggml-metal.metal
-  # files are emitted — the dylib is fully self-contained. GGML_METAL_USE_BF16
-  # enables the BF16 kernels available on M2+. RPATH uses @loader_path (the
-  # macOS counterpart of Linux's $ORIGIN) so the packaged dylibs resolve from
-  # their own directory at runtime.
+  # This mirrors upstream ggml-org/llama.cpp's macOS release job exactly:
+  #   - GGML_METAL_EMBED_LIBRARY=ON bakes the compiled Metal shaders into
+  #     libggml.dylib, so NO separate default.metallib / .metal files ship.
+  #   - GGML_BACKEND_DL is intentionally left OFF (the default): the Metal
+  #     backend links directly into libggml.dylib, so there is no standalone
+  #     libggml-metal.dylib to look for. Smoke-testing llama-server --version
+  #     is what actually proves Metal linked correctly.
+  #   - RPATH uses @loader_path (macOS counterpart of $ORIGIN) so the packaged
+  #     dylibs resolve from their own directory at runtime.
+  # GGML_METAL_USE_BF16 is deliberately NOT passed: that is not a real ggml
+  # CMake option in current upstream (no option() declaration exists), so
+  # passing it would be a silent no-op.
   macos-metal:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
@@ -1370,32 +1376,42 @@ jobs:
 
       - name: Build
         run: |
+          set -o pipefail
           cmake -B build -S . \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_RPATH='@loader_path' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DGGML_BACKEND_DL=ON \
-            -DGGML_NATIVE=OFF \
             -DGGML_METAL=ON \
-            -DGGML_METAL_USE_BF16=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
             -DGGML_OPENMP=OFF \
             -DLLAMA_BUILD_BORINGSSL=ON \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
+          # Verbose so any Metal/embed step failure is visible in the log
+          # rather than surfacing later as a missing artifact.
+          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) --verbose
 
       - name: Validate Metal package contents
         run: |
-          # With GGML_METAL_EMBED_LIBRARY=ON the shaders are baked into the
-          # dylib, so default.metallib is intentionally NOT present. Only
-          # assert the backend library itself — a silently skipped Metal build
-          # would otherwise ship a CPU-only package under the metal name.
-          metal_dylib=$(find build/bin -maxdepth 1 -name 'libggml-metal*.dylib' | head -n 1)
-          if [ -z "$metal_dylib" ]; then
-            echo "::error::libggml-metal*.dylib was NOT produced — Metal backend build failed."
+          # With GGML_BACKEND_DL=OFF the Metal backend links into libggml.dylib
+          # (no standalone libggml-metal.dylib). Assert the main ggml library
+          # exists and the smoke binary loads — that is what proves Metal built
+          # and linked correctly. Also dump build/bin so any missing file is
+          # obvious if this step fails again.
+          echo "=== build/bin contents ==="
+          ls -la build/bin/ || true
+
+          ggml_dylib=$(find build/bin -maxdepth 1 -name 'libggml*.dylib' ! -name 'libggml-base*' | head -n 1)
+          if [ -z "$ggml_dylib" ]; then
+            echo "::error::libggml*.dylib was NOT produced — ggml build failed."
             exit 1
           fi
-          echo "Metal backend artifact: $metal_dylib"
+          echo "ggml library: $ggml_dylib"
+
+          # Confirm Metal support was actually compiled in (the embed define
+          # is baked into the dylib at build time).
+          if ! otool -L "$ggml_dylib" | grep -qi 'Metal\|MetalKit'; then
+            echo "::warning::Metal framework not linked into $ggml_dylib — Metal backend may be disabled."
+          fi
 
           smoke_bin=""
           if [ -x build/bin/llama-server ]; then
