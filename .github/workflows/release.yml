@@ -714,25 +714,16 @@ jobs:
 
   # ARM64 (aarch64) counterpart of ubuntu-vulkan. The LunarG Vulkan SDK only
   # publishes x86_64 Linux tarballs, so this job cannot reuse the
-  # linux-setup-vulkan action — instead glslc comes from Ubuntu's `universe`
-  # apt repo, which ships a native arm64 .deb. Everything else mirrors the
-  # x86_64 Vulkan job so the glibc-portability matrix (22.04 + 24.04) and the
-  # $ORIGIN RPATH packaging stay identical.
+  # linux-setup-vulkan action. Instead glslc comes from Ubuntu's `universe` apt
+  # repo — but that package is ONLY built for arm64 on 24.04 (noble), not on
+  # 22.04 (jammy). So unlike the x86_64 Vulkan job there is no 22.04/24.04
+  # glibc-portability matrix here: only ubuntu-24.04-arm is supported. This
+  # matches what upstream ggml-org/llama.cpp ships. Everything else mirrors the
+  # x86_64 Vulkan job ($ORIGIN RPATH, patchelf, ldd validation).
   ubuntu-arm-vulkan:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        # Same glibc-portability rationale as ubuntu-vulkan: 22.04 (lowest
-        # glibc — portable to anything newer) up to 24.04 (current LTS).
-        include:
-          - os: ubuntu-22.04-arm
-            ubuntu_version: "2204"
-          - os: ubuntu-24.04-arm
-            ubuntu_version: "2404"
-
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Clone
@@ -746,21 +737,19 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: ubuntu-arm-vulkan-${{ matrix.ubuntu_version }}
+          key: ubuntu-arm-vulkan-2404
           evict-old-files: 1d
 
       - name: Dependencies
         run: |
-          # Drop flaky third-party apt sources (packages.microsoft.com
-          # intermittently 403s on GitHub runners) so apt-get update succeeds;
-          # all packages we need are in Ubuntu's own main/universe repos.
-          # glslc lives in `universe`; on arm64 there is no LunarG SDK tarball,
-          # so the distro package is the native shader compiler here.
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
-                      /etc/apt/sources.list.d/azure-cli.list 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build patchelf \
-            libvulkan-dev spirv-headers spirv-tools glslc wget xz-utils
+          # glslc lives in Ubuntu's `universe` repo and is only packaged for
+          # arm64 on 24.04 (the reason this job is 24.04-only). gcc-14/g++-14
+          # match upstream's 24.04 Vulkan toolchain selection.
+          sudo apt-get update -y
+          sudo apt-get install -y gcc-14 g++-14 build-essential cmake ninja-build patchelf \
+            glslc libvulkan-dev spirv-headers spirv-tools wget xz-utils
+          echo "CC=gcc-14"  >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
 
       - name: Build
         # No VULKAN_SDK env: glslc is on PATH via apt, and CMake's
@@ -847,13 +836,13 @@ jobs:
           pkgdir="llama-${{ steps.tag.outputs.name }}"
           mkdir -p "$pkgdir"
           cp -a build/bin/. "$pkgdir/"
-          tar -cJf llama-ubuntu-vulkan-arm64-ubuntu-${{ matrix.ubuntu_version }}.tar.xz "$pkgdir"
+          tar -cJf llama-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz "$pkgdir"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-ubuntu-vulkan-arm64-ubuntu-${{ matrix.ubuntu_version }}.tar.xz
-          name: llama-ubuntu-vulkan-arm64-ubuntu-${{ matrix.ubuntu_version }}.tar.xz
+          path: llama-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz
+          name: llama-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz
 
   windows-cpu:
     needs: resolve-upstream-tag
@@ -1350,17 +1339,19 @@ jobs:
           name: llama-bin-win-vulkan-x64.zip
 
   # macOS Metal build for Apple Silicon. Metal is on by default on APPLE and
-  # targets the integrated/discrete GPU; on M-series chips it is the primary
-  # accelerator, so this single arm64 package covers the meaningful macOS
-  # audience (Intel Macs are not built here). GGML_BACKEND_DL keeps the Metal
-  # backend in a loadable libggml-metal.dylib, matching the Linux/Windows GPU
-  # package layout; default.metallib (the compiled shaders) ships next to it.
-  # No CPU-only variant is produced — the Metal package already bundles the
-  # CPU fallback in the same directory.
+  # is the primary accelerator on M-series chips, so this single arm64 package
+  # covers the meaningful macOS audience (Intel Macs are not built here).
+  #
+  # GGML_METAL_EMBED_LIBRARY=ON bakes the compiled Metal shaders directly into
+  # libggml-metal.dylib, so NO separate default.metallib / ggml-metal.metal
+  # files are emitted — the dylib is fully self-contained. GGML_METAL_USE_BF16
+  # enables the BF16 kernels available on M2+. RPATH uses @loader_path (the
+  # macOS counterpart of Linux's $ORIGIN) so the packaged dylibs resolve from
+  # their own directory at runtime.
   macos-metal:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
-    runs-on: macos-14
+    runs-on: macos-26
 
     steps:
       - name: Clone
@@ -1377,43 +1368,34 @@ jobs:
           key: macos-metal-arm64
           evict-old-files: 1d
 
-      - name: Dependencies
-        # The macos-14 runner ships cmake, ninja, git, and OpenSSL already;
-        # no Homebrew installs are needed. Xcode Command Line Tools provide
-        # xcrun and the Metal shader compiler (metal) used to build the .metallib.
-        run: cmake --version && ninja --version
-
       - name: Build
-        # No $ORIGIN RPATH handling: that is Linux-only. On macOS CMake sets
-        # @rpath/@executable_path install names by default, and keeping every
-        # dylib + the metallib in the same dir as the executables is enough
-        # for the loader to resolve them.
         run: |
           cmake -B build -S . \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_BACKEND_DL=ON \
             -DGGML_NATIVE=OFF \
             -DGGML_METAL=ON \
+            -DGGML_METAL_USE_BF16=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
             -DGGML_OPENMP=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
 
       - name: Validate Metal package contents
         run: |
-          # Assert the Metal backend and its compiled shader library were
-          # produced — a silently skipped Metal build would otherwise ship a
-          # CPU-only package under the metal name.
+          # With GGML_METAL_EMBED_LIBRARY=ON the shaders are baked into the
+          # dylib, so default.metallib is intentionally NOT present. Only
+          # assert the backend library itself — a silently skipped Metal build
+          # would otherwise ship a CPU-only package under the metal name.
           metal_dylib=$(find build/bin -maxdepth 1 -name 'libggml-metal*.dylib' | head -n 1)
           if [ -z "$metal_dylib" ]; then
             echo "::error::libggml-metal*.dylib was NOT produced — Metal backend build failed."
             exit 1
           fi
-          if [ ! -f build/bin/default.metallib ]; then
-            echo "::error::default.metallib was NOT produced — Metal shaders did not compile."
-            exit 1
-          fi
           echo "Metal backend artifact: $metal_dylib"
-          echo "Metal shader library:   build/bin/default.metallib"
 
           smoke_bin=""
           if [ -x build/bin/llama-server ]; then
@@ -1615,7 +1597,7 @@ jobs:
                 '- Ubuntu x64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-x64.tar.xz` (replace XX with your GPU compute capability)',
                 `- [Ubuntu x64 (OpenVINO 2026.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz)`,
                 '- Ubuntu x64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-x64-ubuntu-XXXX.tar.xz` (choose the matching Ubuntu version: 2204 or 2404)',
-                '- Ubuntu ARM64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-arm64-ubuntu-XXXX.tar.xz` (choose the matching Ubuntu version: 2204 or 2404)',
+                '- Ubuntu ARM64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz` (Ubuntu 24.04 LTS, ARM64 only)',
                 '',
                 '**Windows:**',
                 `- [Windows x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-rocm-7.13-x64.zip)`,
