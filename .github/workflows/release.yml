@@ -609,7 +609,10 @@ jobs:
             ocl-icd-opencl-dev
 
       - name: Setup Intel oneAPI (DPC++/SYCL toolchain)
-        uses: ./.github/actions/linux-setup-oneapi
+        # Referenced via @lemonade (not ./.github/actions/...) because this job
+        # checks out UPSTREAM ggml-org/llama.cpp source, where this fork-only
+        # action does not exist. Same pattern the linux-setup-openvino step uses.
+        uses: lemonade-sdk/llama.cpp/.github/actions/linux-setup-oneapi@lemonade
 
       - name: Build
         run: |
