@@ -564,6 +564,163 @@ jobs:
           path: llama-bin-ubuntu-openvino-${{ env.OPENVINO_VERSION_MAJOR }}-x64.tar.gz
           name: llama-bin-ubuntu-openvino-${{ env.OPENVINO_VERSION_MAJOR }}-x64.tar.gz
 
+  # Intel GPU build via the SYCL backend (oneAPI DPC++ toolchain). Mirrors the
+  # ubuntu-22-openvino job's packaging discipline (runtime libs bundled next to
+  # the binaries, $ORIGIN RPATH, ldd validation) since both ship an Intel GPU
+  # runtime that the host's driver resolves at load time. Only Intel GPUs are
+  # available on the runner (none, in CI), so the smoke test is limited to
+  # `--version` — same as the OpenVINO job.
+  ubuntu-22-sycl:
+    needs: resolve-upstream-tag
+    if: needs.resolve-upstream-tag.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          repository: 'ggml-org/llama.cpp'
+          ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: ubuntu-sycl
+          evict-old-files: 1d
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build patchelf \
+            level-zero-dev ocl-icd-opencl-dev
+
+      - name: Setup Intel oneAPI (DPC++/SYCL toolchain)
+        uses: ./.github/actions/linux-setup-oneapi
+
+      - name: Build
+        run: |
+          source /opt/intel/oneapi/setvars.sh --force
+          cmake -B build -S . \
+            -DGGML_SYCL=ON \
+            -DGGML_SYCL_F16=ON \
+            -DCMAKE_C_COMPILER=icx \
+            -DCMAKE_CXX_COMPILER=icpx \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_OPENMP=OFF \
+            -DGGML_STATIC=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Bundle SYCL runtime libraries
+        run: |
+          # oneAPI ships its SYCL/OpenMP/Level-Zero runtime shared libraries
+          # under versioned compiler-rt directories. Resolve them via the
+          # environment that setvars.sh exports, then copy the whole soname
+          # family (including symlinks) so the loader can pick the right one.
+          source /opt/intel/oneapi/setvars.sh --force
+
+          copy_lib() {
+            local lib="$1"
+            local src
+            src=$(find /opt/intel/oneapi -name "${lib}*" -type f 2>/dev/null | head -n 1)
+            if [ -z "$src" ]; then
+              echo "::warning::Library '${lib}*' not found under /opt/intel/oneapi — skipping."
+              return
+            fi
+            local srcdir
+            srcdir=$(dirname "$src")
+            cp -aL "$srcdir"/${lib}* build/bin/
+          }
+
+          # SYCL runtime, Unified Runtime adapter/loader, OpenMP, and the
+          # Level Zero loader. The Intel GPU driver itself (libdrm-intel,
+          # kernel driver) is provided by the user's system — never bundled.
+          for lib in libsycl.so libur_adapter_level_zero.so libur_loader.so \
+                     libomp.so libze_loader.so; do
+            copy_lib "$lib"
+          done
+
+      - name: Set RPATH for portable distribution
+        run: |
+          for f in build/bin/*; do
+            [ -f "$f" ] && ! [ -L "$f" ] || continue
+            if file "$f" | grep -q 'ELF'; then
+              patchelf --set-rpath '$ORIGIN' "$f"
+            fi
+          done
+
+      - name: Validate SYCL package contents
+        run: |
+          shopt -s nullglob
+
+          required_libs=(libggml-sycl.so libggml.so)
+          for lib in "${required_libs[@]}"; do
+            matches=(build/bin/${lib}*)
+            if [ ${#matches[@]} -eq 0 ]; then
+              echo "::error::Missing required library matching ${lib}*"
+              exit 1
+            fi
+          done
+
+          smoke_bin=""
+          if [ -x build/bin/llama-server ]; then
+            smoke_bin=build/bin/llama-server
+          else
+            smoke_bin=$(find build/bin -maxdepth 1 -type f -name 'llama-*' -perm -111 | head -n 1)
+          fi
+          if [ -z "$smoke_bin" ]; then
+            echo "::error::No llama executable found for smoke testing"
+            exit 1
+          fi
+          "$smoke_bin" --version >/dev/null
+
+          for f in build/bin/*; do
+            [ -f "$f" ] && ! [ -L "$f" ] || continue
+            if ! file "$f" | grep -q 'ELF'; then
+              continue
+            fi
+
+            rpath=$(patchelf --print-rpath "$f")
+            if [ "$rpath" != '$ORIGIN' ]; then
+              echo "::error::Unexpected RPATH '$rpath' for $f"
+              exit 1
+            fi
+
+            # The Intel GPU stack (Level Zero loader, OpenCL ICD) is provided by
+            # the host driver at runtime — treat those as resolved, mirroring how
+            # the OpenVINO job exempts libOpenCL.so.1.
+            missing=$(ldd "$f" | awk '/=> not found/ && $1 !~ /^(libze_loader|libOpenCL)\./ { print }')
+            if [ -n "$missing" ]; then
+              echo "::error::Unresolved runtime dependencies for $f"
+              echo "$missing"
+              exit 1
+            fi
+          done
+
+      - name: Determine tag name
+        id: tag
+        uses: lemonade-sdk/llama.cpp/.github/actions/get-tag-name@lemonade
+
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          pkgdir="llama-${{ steps.tag.outputs.name }}"
+          mkdir -p "$pkgdir"
+          cp -a build/bin/. "$pkgdir/"
+          tar -czf llama-bin-ubuntu-sycl-x64.tar.gz "$pkgdir"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-ubuntu-sycl-x64.tar.gz
+          name: llama-bin-ubuntu-sycl-x64.tar.gz
+
   ubuntu-vulkan:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
@@ -1465,6 +1622,7 @@ jobs:
       - ubuntu-22-rocm
       - ubuntu-22-cuda
       - ubuntu-22-openvino
+      - ubuntu-22-sycl
       - ubuntu-vulkan
       - ubuntu-arm-vulkan
       - macos-metal
@@ -1612,6 +1770,7 @@ jobs:
                 `- [Ubuntu x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz)`,
                 '- Ubuntu x64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-x64.tar.xz` (replace XX with your GPU compute capability)',
                 `- [Ubuntu x64 (OpenVINO 2026.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz)`,
+                `- [Ubuntu x64 (SYCL / Intel GPU)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-sycl-x64.tar.gz)`,
                 '- Ubuntu x64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-x64-ubuntu-XXXX.tar.xz` (choose the matching Ubuntu version: 2204 or 2404)',
                 '- Ubuntu ARM64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz` (Ubuntu 24.04 LTS, ARM64 only)',
                 '',
