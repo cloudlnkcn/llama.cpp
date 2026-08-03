@@ -571,11 +571,8 @@ jobs:
   # available on the runner (none, in CI), so the smoke test is limited to
   # `--version` — same as the OpenVINO job.
   #
-  # Built on Ubuntu 24.04 (not 22.04 like the other Intel-toolchain jobs)
-  # because the Level Zero development headers (level-zero-dev / libze-dev)
-  # only entered the official Ubuntu archive in 24.04 — they are absent from
-  # 22.04's main/universe repos, which broke apt there. The newer glibc
-  # baseline is reflected in the artifact name (...-ubuntu-2404.tar.gz).
+  # Runs on Ubuntu 24.04 per request; the artifact name carries -ubuntu-2404
+  # to advertise the newer glibc baseline vs the 22.04-built Linux packages.
   ubuntu-24-sycl:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
@@ -599,12 +596,17 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          # level-zero-dev is only in the Ubuntu 24.04+ archive (24.04 names it
-          # both level-zero-dev and libze-dev); it was missing on 22.04, which
-          # is why this job runs on 24.04. oneAPI also ships its own copy under
-          # $ONEAPI_ROOT, so this is a fallback; both being present is fine.
+          # NOTE: do NOT install a system "level-zero-dev" here. That package
+          # does not exist in either the Ubuntu 22.04/24.04 archives or the
+          # Intel oneAPI apt repo, so apt fails with "Unable to locate package".
+          # The ggml SYCL backend treats Level Zero as a *soft* dependency: it
+          # find_path/find_library's level_zero/ze_api.h + libze_loader under
+          # $ONEAPI_ROOT (set by setvars.sh) and, if found, enables direct
+          # device-memory allocation; if not, it only emits a CMake WARNING and
+          # builds fine without it. The oneAPI DPC++ toolchain ships those
+          # headers/loader itself, so no extra system package is needed.
           sudo apt-get install -y build-essential cmake ninja-build patchelf \
-            level-zero-dev ocl-icd-opencl-dev
+            ocl-icd-opencl-dev
 
       - name: Setup Intel oneAPI (DPC++/SYCL toolchain)
         uses: ./.github/actions/linux-setup-oneapi
