@@ -573,6 +573,9 @@ jobs:
   #
   # Runs on Ubuntu 24.04 per request; the artifact name carries -ubuntu-2404
   # to advertise the newer glibc baseline vs the 22.04-built Linux packages.
+  # oneAPI + Level Zero setup mirrors upstream ggml-org/llama.cpp's
+  # build-sycl.yml (Deep Learning Essentials offline installer + level-zero
+  # .deb from oneapi-src releases) — keep these in sync when bumping versions.
   ubuntu-24-sycl:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
@@ -596,36 +599,39 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          # NOTE: do NOT install a system "level-zero-dev" here. That package
-          # does not exist in either the Ubuntu 22.04/24.04 archives or the
-          # Intel oneAPI apt repo, so apt fails with "Unable to locate package".
-          # The ggml SYCL backend treats Level Zero as a *soft* dependency: it
-          # find_path/find_library's level_zero/ze_api.h + libze_loader under
-          # $ONEAPI_ROOT (set by setvars.sh) and, if found, enables direct
-          # device-memory allocation; if not, it only emits a CMake WARNING and
-          # builds fine without it. The oneAPI DPC++ toolchain ships those
-          # headers/loader itself, so no extra system package is needed.
           sudo apt-get install -y build-essential cmake ninja-build patchelf \
-            ocl-icd-opencl-dev
+            ocl-icd-opencl-dev wget
 
-      - name: Setup Intel oneAPI (DPC++/SYCL toolchain)
-        # Inlined (not a composite action) because this job checks out UPSTREAM
-        # ggml-org/llama.cpp source, and @lemonade action refs resolve against
-        # the lemonade-sdk repo — a fork-only action would need to exist there.
-        # Keeping the setup inline makes this job self-contained.
+      # Install oneAPI via the Deep Learning Essentials offline installer —
+      # exactly what upstream's build-sycl.yml uses. This single bundle ships
+      # the DPC++ compiler AND MKL/oneDNN/TBB *devel* files; the latter are
+      # required because ggml's SYCL backend does find_package(MKL REQUIRED)
+      # for the default INTEL target. Installing only intel-oneapi-compiler-
+      # dpcpp-cpp over apt does NOT pull those devel files and configure fails.
+      # The pinned download URL must be refreshed when moving to a newer
+      # oneAPI release (see upstream build-sycl.yml for the current URL).
+      - name: Setup Intel oneAPI (DPC++/SYCL + MKL + oneDNN)
+        env:
+          ONEAPI_INSTALLER_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/56f7923a-adb8-43f3-8b02-2b60fcac8cab/intel-deep-learning-essentials-2025.3.3.16_offline.sh
         run: |
-          set -eux
-          sudo mkdir --parents --mode=0755 /etc/apt/keyrings
-          wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
-            | gpg --dearmor \
-            | sudo tee /etc/apt/keyrings/oneapi.gpg > /dev/null
-          echo "deb [signed-by=/etc/apt/keyrings/oneapi.gpg] https://apt.repos.intel.com/oneapi all main" \
-            | sudo tee /etc/apt/sources.list.d/oneAPI.list
-          sudo apt-get update
-          sudo apt-get install -y \
-            intel-oneapi-compiler-dpcpp-cpp \
-            intel-oneapi-runtime-dpcpp-cpp \
-            intel-oneapi-runtime-opencl
+          cd /tmp
+          wget -q "$ONEAPI_INSTALLER_URL" -O intel-deep-learning-essentials_offline.sh
+          sudo bash intel-deep-learning-essentials_offline.sh -s -a --silent --eula accept
+
+      # Level Zero is an optional ggml SYCL dependency (direct device-memory
+      # allocation). The headers/loader are NOT in the Ubuntu 24.04 archive nor
+      # the oneAPI apt repo, so install the .deb pair oneapi-src publishes on
+      # GitHub releases — same as upstream build-sycl.yml.
+      - name: Setup Level Zero SDK
+        env:
+          LEVEL_ZERO_VERSION: "1.28.2"
+          LEVEL_ZERO_UBUNTU_VERSION: "u24.04"
+        run: |
+          cd /tmp
+          base="https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}"
+          wget -q "${base}/level-zero_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero.deb
+          wget -q "${base}/level-zero-devel_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero-devel.deb
+          sudo apt-get install -y ./level-zero.deb ./level-zero-devel.deb
 
       - name: Build
         run: |
