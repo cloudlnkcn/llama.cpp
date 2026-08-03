@@ -657,32 +657,42 @@ jobs:
 
       - name: Bundle SYCL runtime libraries
         run: |
-          # oneAPI ships its SYCL/OpenMP/Level-Zero runtime shared libraries
-          # under versioned compiler-rt directories. Resolve them via the
-          # environment that setvars.sh exports, then copy the whole soname
-          # family (including symlinks) so the loader can pick the right one.
+          # Auto-discover every Intel runtime dependency via ldd instead of a
+          # hand-maintained list. After setvars.sh, ldd resolves each build/bin
+          # ELF's deps through /opt/intel/oneapi; we copy anything that resolves
+          # under there — this catches libsycl/libomp/libsvml/libintlc/libirng/
+          # libze_loader/etc. uniformly, including deps a hand-list would miss
+          # (libsvml.so caused a runtime loader failure before this).
+          # The Intel GPU *driver* (libdrm-intel, kernel module) is NOT under
+          # oneapi and is provided by the user's system — never bundled.
           source /opt/intel/oneapi/setvars.sh --force
 
-          copy_lib() {
-            local lib="$1"
-            local src
-            src=$(find /opt/intel/oneapi -name "${lib}*" -type f 2>/dev/null | head -n 1)
-            if [ -z "$src" ]; then
-              echo "::warning::Library '${lib}*' not found under /opt/intel/oneapi — skipping."
-              return
-            fi
-            local srcdir
-            srcdir=$(dirname "$src")
-            cp -aL "$srcdir"/${lib}* build/bin/
-          }
+          # Collect the set of resolved oneapi .so paths across all bundled ELFs.
+          mapfile -t intel_libs < <(
+            for f in build/bin/*; do
+              [ -f "$f" ] && ! [ -L "$f" ] || continue
+              file "$f" | grep -q 'ELF' || continue
+              ldd "$f" 2>/dev/null | awk '/=> \//{print $3}'
+            done | sort -u | grep '^/opt/intel/oneapi' || true
+          )
 
-          # SYCL runtime, Unified Runtime adapter/loader, OpenMP, and the
-          # Level Zero loader. The Intel GPU driver itself (libdrm-intel,
-          # kernel driver) is provided by the user's system — never bundled.
-          for lib in libsycl.so libur_adapter_level_zero.so libur_loader.so \
-                     libomp.so libze_loader.so; do
-            copy_lib "$lib"
+          if [ ${#intel_libs[@]} -eq 0 ]; then
+            echo "::error::No Intel oneAPI runtime dependencies discovered via ldd."
+            exit 1
+          fi
+
+          # Copy each resolved lib PLUS its whole soname family (symlinks) from
+          # the same dir, so the loader finds e.g. libsvml.so.5 via its NEEDED.
+          for lib in "${intel_libs[@]}"; do
+            d=$(dirname "$lib")
+            base=$(find "$d" -maxdepth 1 -name "$(basename "$lib")*" -type f | head -n1)
+            [ -n "$base" ] || continue
+            # Strip the numeric .so.N suffix to get the base name pattern.
+            stem=$(basename "$base" | sed -E 's/\.so.*$/.so/')
+            cp -aL "$d"/"$stem"* build/bin/ 2>/dev/null || true
           done
+          echo "Bundled Intel runtime libraries:"
+          ls build/bin/lib*.so* 2>/dev/null | sort || true
 
       - name: Set RPATH for portable distribution
         run: |
@@ -695,6 +705,7 @@ jobs:
 
       - name: Validate SYCL package contents
         run: |
+          set -e
           shopt -s nullglob
 
           required_libs=(libggml-sycl.so libggml.so)
@@ -716,6 +727,11 @@ jobs:
             echo "::error::No llama executable found for smoke testing"
             exit 1
           fi
+          # Source oneAPI env as a safety net so the smoke test mirrors how an
+          # end user runs the binary; bundled libs + $ORIGIN rpath should make
+          # this unnecessary, but it avoids spurious loader failures if any
+          # transitive Intel dep slipped past the bundle step.
+          source /opt/intel/oneapi/setvars.sh --force >/dev/null
           "$smoke_bin" --version >/dev/null
 
           for f in build/bin/*; do
