@@ -609,10 +609,24 @@ jobs:
             ocl-icd-opencl-dev
 
       - name: Setup Intel oneAPI (DPC++/SYCL toolchain)
-        # Referenced via @lemonade (not ./.github/actions/...) because this job
-        # checks out UPSTREAM ggml-org/llama.cpp source, where this fork-only
-        # action does not exist. Same pattern the linux-setup-openvino step uses.
-        uses: lemonade-sdk/llama.cpp/.github/actions/linux-setup-oneapi@lemonade
+        # Inlined (not a composite action) because this job checks out UPSTREAM
+        # ggml-org/llama.cpp source, and @lemonade action refs resolve against
+        # the lemonade-sdk repo — a fork-only action would need to exist there.
+        # Keeping the setup inline makes this job self-contained.
+        run: |
+          set -eux
+          sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+          wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | gpg --dearmor \
+            | sudo tee /etc/apt/keyrings/oneapi.gpg > /dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/oneapi.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update
+          sudo apt-get install -y \
+            intel-oneapi-compiler-dpcpp-cpp \
+            intel-oneapi-runtime-dpcpp \
+            intel-oneapi-runtime-libs \
+            intel-oneapi-runtime-opencl
 
       - name: Build
         run: |
