@@ -573,9 +573,8 @@ jobs:
   #
   # Runs on Ubuntu 24.04 per request; the artifact name carries -ubuntu-2404
   # to advertise the newer glibc baseline vs the 22.04-built Linux packages.
-  # oneAPI + Level Zero setup mirrors upstream ggml-org/llama.cpp's
-  # build-sycl.yml (Deep Learning Essentials offline installer + level-zero
-  # .deb from oneapi-src releases) — keep these in sync when bumping versions.
+  # oneAPI toolchain (DPC++ + MKL devel + oneDNN devel) is installed from
+  # Intel's apt repo; Level Zero comes from oneapi-src GitHub release .debs.
   ubuntu-24-sycl:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
@@ -596,42 +595,47 @@ jobs:
           key: ubuntu-sycl
           evict-old-files: 1d
 
-      - name: Dependencies
+      - name: Dependencies (Ubuntu + Level Zero SDK)
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake ninja-build patchelf \
-            ocl-icd-opencl-dev wget
+            ocl-icd-opencl-dev wget ca-certificates gnupg
 
-      # Install oneAPI via the Deep Learning Essentials offline installer —
-      # exactly what upstream's build-sycl.yml uses. This single bundle ships
-      # the DPC++ compiler AND MKL/oneDNN/TBB *devel* files; the latter are
-      # required because ggml's SYCL backend does find_package(MKL REQUIRED)
-      # for the default INTEL target. Installing only intel-oneapi-compiler-
-      # dpcpp-cpp over apt does NOT pull those devel files and configure fails.
-      # The pinned download URL must be refreshed when moving to a newer
-      # oneAPI release (see upstream build-sycl.yml for the current URL).
-      - name: Setup Intel oneAPI (DPC++/SYCL + MKL + oneDNN)
-        env:
-          ONEAPI_INSTALLER_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/56f7923a-adb8-43f3-8b02-2b60fcac8cab/intel-deep-learning-essentials-2025.3.3.16_offline.sh
-        run: |
-          cd /tmp
-          wget -q "$ONEAPI_INSTALLER_URL" -O intel-deep-learning-essentials_offline.sh
-          sudo bash intel-deep-learning-essentials_offline.sh -s -a --silent --eula accept
+          # Level Zero headers/loader are NOT in the Ubuntu 24.04 archive nor
+          # the oneAPI apt repo, so install the .deb pair oneapi-src publishes
+          # on GitHub releases (optional ggml SYCL dep: direct device-memory
+          # allocation; missing it only emits a CMake WARNING).
+          lz_ver="1.28.2"; lz_u="u24.04"
+          base="https://github.com/oneapi-src/level-zero/releases/download/v${lz_ver}"
+          wget -q "${base}/level-zero_${lz_ver}%2B${lz_u}_amd64.deb" -O /tmp/level-zero.deb
+          wget -q "${base}/level-zero-devel_${lz_ver}%2B${lz_u}_amd64.deb" -O /tmp/level-zero-devel.deb
+          sudo apt-get install -y /tmp/level-zero.deb /tmp/level-zero-devel.deb
 
-      # Level Zero is an optional ggml SYCL dependency (direct device-memory
-      # allocation). The headers/loader are NOT in the Ubuntu 24.04 archive nor
-      # the oneAPI apt repo, so install the .deb pair oneapi-src publishes on
-      # GitHub releases — same as upstream build-sycl.yml.
-      - name: Setup Level Zero SDK
-        env:
-          LEVEL_ZERO_VERSION: "1.28.2"
-          LEVEL_ZERO_UBUNTU_VERSION: "u24.04"
+      # Install the oneAPI pieces the ggml SYCL backend needs, ALL via the
+      # official Intel apt repo (single mechanism, no pinned offline URLs):
+      #   - intel-oneapi-compiler-dpcpp-cpp : DPC++ (icx/icpx) + setvars.sh
+      #   - intel-oneapi-mkl-devel         : REQUIRED — provides MKLConfig.cmake
+      #                                       + MKL::MKL_SYCL::BLAS (the backend
+      #                                       does find_package(MKL REQUIRED)).
+      #   - intel-oneapi-dnnl-devel        : oneDNN (optional; silences the
+      #                                       find_package(DNNL) warning).
+      # NOTE: the "Deep Learning Essentials" offline installer does NOT ship
+      # oneMKL — confirmed against Intel's component list — so find_package(MKL)
+      # fails even after installing it. The MKL devel apt package is required.
+      - name: Setup Intel oneAPI (DPC++ + MKL devel + oneDNN devel)
         run: |
-          cd /tmp
-          base="https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}"
-          wget -q "${base}/level-zero_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero.deb
-          wget -q "${base}/level-zero-devel_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero-devel.deb
-          sudo apt-get install -y ./level-zero.deb ./level-zero-devel.deb
+          set -eux
+          sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+          wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | gpg --dearmor \
+            | sudo tee /etc/apt/keyrings/oneapi.gpg > /dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/oneapi.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update
+          sudo apt-get install -y \
+            intel-oneapi-compiler-dpcpp-cpp \
+            intel-oneapi-mkl-devel \
+            intel-oneapi-dnnl-devel
 
       - name: Build
         run: |
