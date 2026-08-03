@@ -570,10 +570,16 @@ jobs:
   # runtime that the host's driver resolves at load time. Only Intel GPUs are
   # available on the runner (none, in CI), so the smoke test is limited to
   # `--version` — same as the OpenVINO job.
-  ubuntu-22-sycl:
+  #
+  # Built on Ubuntu 24.04 (not 22.04 like the other Intel-toolchain jobs)
+  # because the Level Zero development headers (level-zero-dev / libze-dev)
+  # only entered the official Ubuntu archive in 24.04 — they are absent from
+  # 22.04's main/universe repos, which broke apt there. The newer glibc
+  # baseline is reflected in the artifact name (...-ubuntu-2404.tar.gz).
+  ubuntu-24-sycl:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Clone
@@ -593,6 +599,10 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
+          # level-zero-dev is only in the Ubuntu 24.04+ archive (24.04 names it
+          # both level-zero-dev and libze-dev); it was missing on 22.04, which
+          # is why this job runs on 24.04. oneAPI also ships its own copy under
+          # $ONEAPI_ROOT, so this is a fallback; both being present is fine.
           sudo apt-get install -y build-essential cmake ninja-build patchelf \
             level-zero-dev ocl-icd-opencl-dev
 
@@ -713,13 +723,13 @@ jobs:
           pkgdir="llama-${{ steps.tag.outputs.name }}"
           mkdir -p "$pkgdir"
           cp -a build/bin/. "$pkgdir/"
-          tar -czf llama-bin-ubuntu-sycl-x64.tar.gz "$pkgdir"
+          tar -czf llama-bin-ubuntu-sycl-x64-ubuntu-2404.tar.gz "$pkgdir"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-ubuntu-sycl-x64.tar.gz
-          name: llama-bin-ubuntu-sycl-x64.tar.gz
+          path: llama-bin-ubuntu-sycl-x64-ubuntu-2404.tar.gz
+          name: llama-bin-ubuntu-sycl-x64-ubuntu-2404.tar.gz
 
   ubuntu-vulkan:
     needs: resolve-upstream-tag
@@ -1622,7 +1632,7 @@ jobs:
       - ubuntu-22-rocm
       - ubuntu-22-cuda
       - ubuntu-22-openvino
-      - ubuntu-22-sycl
+      - ubuntu-24-sycl
       - ubuntu-vulkan
       - ubuntu-arm-vulkan
       - macos-metal
@@ -1770,7 +1780,7 @@ jobs:
                 `- [Ubuntu x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz)`,
                 '- Ubuntu x64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-x64.tar.xz` (replace XX with your GPU compute capability)',
                 `- [Ubuntu x64 (OpenVINO 2026.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz)`,
-                `- [Ubuntu x64 (SYCL / Intel GPU)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-sycl-x64.tar.gz)`,
+                `- [Ubuntu x64 (SYCL / Intel GPU, Ubuntu 24.04)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-sycl-x64-ubuntu-2404.tar.gz)`,
                 '- Ubuntu x64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-x64-ubuntu-XXXX.tar.xz` (choose the matching Ubuntu version: 2204 or 2404)',
                 '- Ubuntu ARM64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz` (Ubuntu 24.04 LTS, ARM64 only)',
                 '',
