@@ -727,13 +727,33 @@ jobs:
             echo "::error::No llama executable found for smoke testing"
             exit 1
           fi
+
           # Source oneAPI env as a safety net so the smoke test mirrors how an
           # end user runs the binary; bundled libs + $ORIGIN rpath should make
           # this unnecessary, but it avoids spurious loader failures if any
           # transitive Intel dep slipped past the bundle step.
           source /opt/intel/oneapi/setvars.sh --force >/dev/null
-          "$smoke_bin" --version >/dev/null
 
+          # The runner has no Intel GPU, and the SYCL backend's dpct device
+          # manager THROWS ("can not find preferred GPU platform") when the
+          # backend is auto-loaded during llama-server --version (which probes
+          # all backends incl. RPC). That's an environment limitation, not a
+          # build defect. Temporarily move libggml-sycl.so aside so the
+          # GPU-less smoke test can exercise the rest of the binary, then
+          # restore it — the SYCL backend itself is link-checked via ldd below.
+          sycl_backend=""
+          for f in build/bin/libggml-sycl.so*; do
+            [ -L "$f" ] && continue
+            sycl_backend="$f"; break
+          done
+          if [ -n "$sycl_backend" ]; then
+            mv "$sycl_backend" "$sycl_backend.disabled"
+          fi
+          "$smoke_bin" --version >/dev/null
+          # Restore the SYCL backend so it ships in the artifact.
+          [ -n "$sycl_backend" ] && mv "$sycl_backend.disabled" "$sycl_backend"
+
+          # Link check across the whole package, including the SYCL backend.
           for f in build/bin/*; do
             [ -f "$f" ] && ! [ -L "$f" ] || continue
             if ! file "$f" | grep -q 'ELF'; then
