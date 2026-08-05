@@ -692,24 +692,36 @@ jobs:
             cp -aL "$d"/"$stem"* build/bin/ 2>/dev/null || true
           done
 
-          # ldd CANNOT see two classes of indirect deps that the SYCL backend
+          # ldd CANNOT see three classes of indirect deps that the SYCL backend
           # still needs at runtime — copy them explicitly (resolving symlinks).
-          # Without these the shipped binary fails silently on a real Intel GPU:
+          # Without ANY of these the shipped binary fails silently on a real
+          # Intel GPU (SYCL throws "No device of requested type available" during
+          # ggml_sycl_init, the backend is skipped, --list-devices returns
+          # "(none)" and the model runs on CPU only):
+          #
           #   - libur_adapter_*.so : the Unified Runtime adapters that
           #     libur_loader.so dlopens at runtime to actually enumerate Intel
           #     GPUs. No ELF NEEDED references them, so ldd never lists them.
-          #     Missing them => SYCL throws "No device of requested type
-          #     available" during ggml_sycl_init, the backend is skipped, and
-          #     --list-devices returns "(none)" — model runs on CPU only.
+          #   - libumf.so* : Unified Memory Framework, a direct NEEDED of the
+          #     level-zero adapter. ldd misses it because the adapter itself is
+          #     only dlopened (so its deps are never walked during build/bin
+          #     scanning). Verified on Arc Pro B60: without libumf the adapter
+          #     loads but device enumeration returns 0 devices.
           #   - libtbb*.so / libtbbbind*.so : oneAPI's oneTBB. The system
           #     libtbb12 may satisfy ldd (no "not found"), but MKL's TBB
           #     threading backend is built against this exact oneTBB ABI;
           #     loading the system copy yields `undefined symbol:
           #     ...tbb::detail::r1::get_thread_reference_vertex...` and the
           #     SYCL backend fails to dlopen.
+          #
+          # NOTE: the level-zero adapters ship with RUNPATH '$ORIGIN/../lib'
+          # (oneAPI's two-tier layout). The Set-RPATH step below rewrites every
+          # ELF in build/bin to '$ORIGIN', which is what lets the flat package
+          # resolve libumf at runtime — keep that step or GPU enumeration breaks.
           find /opt/intel/oneapi -name 'libur_adapter_*.so*' -exec cp -aL {} build/bin/ \;
-          find /opt/intel/oneapi -name 'libtbb.so*'        -exec cp -aL {} build/bin/ \;
-          find /opt/intel/oneapi -name 'libtbbbind*.so*'   -exec cp -aL {} build/bin/ \;
+          find /opt/intel/oneapi -name 'libumf.so*'          -exec cp -aL {} build/bin/ \;
+          find /opt/intel/oneapi -name 'libtbb.so*'          -exec cp -aL {} build/bin/ \;
+          find /opt/intel/oneapi -name 'libtbbbind*.so*'     -exec cp -aL {} build/bin/ \;
           # Some oneAPI installs ship debug variants (libtbbbind_*_debug.so*);
           # they are large and never needed at runtime — drop any we just
           # copied to keep the package lean.
@@ -720,6 +732,13 @@ jobs:
 
       - name: Set RPATH for portable distribution
         run: |
+          # Rewrite every bundled ELF's RUNPATH to '$ORIGIN' so the flat
+          # package is self-contained. This is load-bearing for the SYCL
+          # level-zero adapters: they ship from oneAPI with RUNPATH
+          # '$ORIGIN/../lib' (oneAPI's bin/ + lib/ layout), and libumf.so is
+          # their direct NEEDED. Without this rewrite the adapter looks for
+          # libumf in <pkg>/../lib/ — which doesn't exist in our flat tarball —
+          # and SYCL device enumeration silently fails. See the Bundle step.
           for f in build/bin/*; do
             [ -f "$f" ] && ! [ -L "$f" ] || continue
             if file "$f" | grep -q 'ELF'; then
@@ -741,14 +760,16 @@ jobs:
             fi
           done
 
-          # Regression guards for the two indirect deps ldd can't discover
+          # Regression guards for the three indirect deps ldd can't discover
           # (see the Bundle step). Without these the SYCL backend silently
           # fails to enumerate the GPU on end-user machines:
           #   - libur_adapter_level_zero.so : dlopened by libur_loader at
           #     runtime; absent => "No device of requested type available".
+          #   - libumf.so : direct NEEDED of the level-zero adapter; absent =>
+          #     adapter loads but device enumeration returns 0 devices.
           #   - libtbb.so : correct oneTBB ABI for MKL TBB threading; absent
           #     => undefined-symbol failure loading libggml-sycl.so.
-          for lib in 'libur_adapter_level_zero.so*' 'libtbb.so*'; do
+          for lib in 'libur_adapter_level_zero.so*' 'libumf.so*' 'libtbb.so*'; do
             matches=(build/bin/${lib})
             if [ ${#matches[@]} -eq 0 ]; then
               echo "::error::Missing ${lib} — SYCL backend won't see the GPU at runtime"
