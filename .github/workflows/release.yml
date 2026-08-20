@@ -924,7 +924,10 @@ jobs:
         # standalone `glslc`/`shaderc` apt packages are missing from the
         # GitHub runner's default sources on both 22.04 and 24.04, so install
         # the SDK instead — this is version- and repo-agnostic.
-        uses: ./.github/actions/linux-setup-vulkan
+        # Referenced via the fork repo (not a local ./ path) because this job's
+        # Clone step checks out upstream ggml-org/llama.cpp, which does not
+        # ship this action; same pattern as get-tag-name/linux-setup-openvino.
+        uses: lemonade-sdk/llama.cpp/.github/actions/linux-setup-vulkan@lemonade
         with:
           path: ${{ github.workspace }}/vulkansdk
           version: ${{ env.VULKAN_SDK_VERSION }}
