@@ -589,6 +589,25 @@ jobs:
           repository: 'ggml-org/llama.cpp'
           ref: ${{ needs.resolve-upstream-tag.outputs.tag }}
 
+      # ggml-sycl defaults GGML_SYCL_USE_ASYNC_MEM_OP=1; the async_free path
+      # queries the experimental Level Zero graph-capture API. Public Intel
+      # compute-runtime drivers (<= 26.27, latest as of 2026-08) do not
+      # implement that entry point, so the UR adapter calls a NULL pointer and
+      # llama-server segfaults on the first SYCL kernel submit. Reproduced on
+      # Arc Pro B60 with every oneAPI runtime we can bundle (2025.3 / 2026.0 /
+      # 2026.1) — pinning the toolchain does NOT help, only this default does.
+      # Flip it OFF in our release builds; users on fixed drivers can opt back
+      # in with GGML_SYCL_USE_ASYNC_MEM_OP=1.
+      - name: Patch SYCL async-mem default off (driver compat)
+        run: |
+          f="ggml/src/ggml-sycl/ggml-sycl.cpp"
+          if grep -q 'ggml_sycl_get_env("GGML_SYCL_USE_ASYNC_MEM_OP", 1)' "$f"; then
+            sed -i 's/ggml_sycl_get_env("GGML_SYCL_USE_ASYNC_MEM_OP", 1)/ggml_sycl_get_env("GGML_SYCL_USE_ASYNC_MEM_OP", 0)/' "$f"
+            echo "async-mem default patched OFF"
+          else
+            echo "::warning::GGML_SYCL_USE_ASYNC_MEM_OP pattern not found; upstream restructured or fixed the async-mem path. Building unpatched."
+          fi
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
