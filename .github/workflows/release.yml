@@ -891,7 +891,10 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     env:
-      VULKAN_SDK_VERSION: "1.4.341.0"
+      # Latest stable LunarG SDK (1.4.350.0, May 2026). Bump when LunarG
+      # publishes a newer stable release; linux-setup-vulkan downloads the
+      # matching Linux tarball from sdk.lunarg.com.
+      VULKAN_SDK_VERSION: "1.4.350.0"
 
     steps:
       - name: Clone
@@ -1486,9 +1489,9 @@ jobs:
 
     env:
       # 1.4.309.0 is the latest Vulkan SDK that publishes a Windows installer
-      # at the LunarG download URL; newer 1.4.x point releases (e.g. 1.4.341.0)
-      # ship a Linux tarball but no matching Windows installer, so the Windows
-      # and Linux versions intentionally differ.
+      # at the LunarG download URL; newer 1.4.x point releases (latest stable
+      # is 1.4.350.0) ship a Linux tarball but no matching Windows installer,
+      # so the Windows and Linux versions intentionally differ.
       VULKAN_SDK_VERSION: "1.4.309.0"
 
     steps:
@@ -1875,23 +1878,74 @@ jobs:
             mv "$z_file" "release/$z_name"
           done
 
-      - name: Determine release summary
-        id: release_summary
-        run: |
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            echo "value=Nightly release for ${{ github.sha }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Inherit upstream release notes
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const tag = '${{ steps.tag.outputs.name }}';
+            // Upstream ggml-org publishes a structured changelog for every
+            // release; inherit it as the top section of our release notes so
+            // fork releases carry the real version history (new models, API
+            // changes, full commit list) instead of only the bump-commit
+            // subject. Falls back to the download-links section alone when
+            // upstream has no release for this tag.
+            let notes = '';
+            try {
+              notes = (await github.rest.repos.getReleaseByTag({
+                owner: 'ggml-org',
+                repo: 'llama.cpp',
+                tag
+              })).data.body || '';
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              core.warning(`No upstream release notes found for ${tag}`);
+            }
+            if (notes) notes += '\n\n---\n\n';
+            fs.writeFileSync('release-notes.md', notes);
 
       - name: Check release artifacts
         run: |
-          files=$(find ./release -maxdepth 1 \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.tar.xz' -o -name '*.7z' \) 2>/dev/null | wc -l)
-          if [ "$files" -eq 0 ]; then
-            echo "No release artifacts found in ./release — aborting before creating a release."
+          set -euo pipefail
+          tag='${{ steps.tag.outputs.name }}'
+          # Full manifest mirroring the build matrices. The ROCm (7.13) and
+          # OpenVINO (2026.0) versions are baked into the asset names — keep
+          # in sync with the ROCM matrix and OPENVINO_VERSION_MAJOR.
+          expected=(
+            "llama-${tag}-bin-ubuntu-x64.tar.gz"
+            "llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz"
+            "llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz"
+            "llama-${tag}-bin-ubuntu-sycl-x64-ubuntu-2404.tar.gz"
+          )
+          for sm in 70 75 80 86 89 90 100 120; do
+            expected+=("llama-${tag}-ubuntu-cuda-sm_${sm}-x64.tar.xz")
+          done
+          expected+=(
+            "llama-${tag}-ubuntu-vulkan-x64-ubuntu-2204.tar.xz"
+            "llama-${tag}-ubuntu-vulkan-x64-ubuntu-2404.tar.xz"
+            "llama-${tag}-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz"
+            "llama-${tag}-bin-win-cpu-x64.zip"
+            "llama-${tag}-bin-win-rocm-7.13-x64.zip"
+            "llama-${tag}-bin-win-vulkan-x64.zip"
+          )
+          for sm in 70 75 80 86 89 90 100 120; do
+            expected+=("llama-${tag}-windows-cuda-sm_${sm}-x64.7z")
+          done
+          expected+=("llama-${tag}-bin-macos-metal-arm64.tar.gz")
+
+          missing=0
+          for f in "${expected[@]}"; do
+            if [ ! -f "release/$f" ]; then
+              echo "::error::Missing release artifact: $f"
+              missing=1
+            fi
+          done
+          actual=$(find ./release -maxdepth 1 -type f | wc -l)
+          echo "Prepared ${actual} artifact(s); manifest expects ${#expected[@]}."
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Release artifacts incomplete — a download/move step dropped files. Refill by re-running this workflow with force_build."
             exit 1
           fi
-          echo "Found $files artifact(s) ready to upload."
 
       # Get the release for this tag, creating it if it does not exist yet.
       # This is idempotent: if a previous run created the release but failed
@@ -1902,44 +1956,52 @@ jobs:
         uses: actions/github-script@v8
         env:
           TAG_NAME: ${{ steps.tag.outputs.name }}
-          RELEASE_SUMMARY: ${{ steps.release_summary.outputs.value }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const tag = process.env.TAG_NAME;
             const { owner, repo } = context.repo;
+            const fs = require('fs');
+            // Inherited upstream changelog (empty when upstream has no release
+            // for this tag) followed by this fork's prebuilt-download links.
+            const upstreamNotes = fs.existsSync('release-notes.md')
+              ? fs.readFileSync('release-notes.md', 'utf8')
+              : '';
+            const body = [
+              upstreamNotes,
+              '**Prebuilt binaries (this fork):**',
+              '',
+              '**Linux:**',
+              `- [Ubuntu x64 (CPU)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-x64.tar.gz)`,
+              `- [Ubuntu x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz)`,
+              '- Ubuntu x64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-x64.tar.xz` (replace XX with your GPU compute capability)',
+              `- [Ubuntu x64 (OpenVINO 2026.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz)`,
+              `- [Ubuntu x64 (SYCL / Intel GPU, Ubuntu 24.04)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-sycl-x64-ubuntu-2404.tar.gz)`,
+              '- Ubuntu x64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-x64-ubuntu-XXXX.tar.xz` (choose the matching Ubuntu version: 2204 or 2404)',
+              '- Ubuntu ARM64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz` (Ubuntu 24.04 LTS, ARM64 only)',
+              '',
+              '**Windows:**',
+              `- [Windows x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-rocm-7.13-x64.zip)`,
+              '- Windows x64 (CUDA): `llama-' + tag + '-windows-cuda-sm_XX-x64.7z` (replace XX with your GPU compute capability)',
+              `- [Windows x64 (Vulkan 1.4.309.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-vulkan-x64.zip)`,
+              '',
+              '**macOS:**',
+              `- [macOS ARM64 (Metal)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-macos-metal-arm64.tar.gz)`,
+            ].join('\n');
             let release;
             try {
               release = (await github.rest.repos.getReleaseByTag({ owner, repo, tag })).data;
               core.info(`Reusing existing release ${tag} (id ${release.id})`);
+              // Refresh the notes on refill runs so an existing release also
+              // carries the inherited upstream changelog.
+              if (release.body !== body) {
+                await github.rest.repos.updateRelease({ owner, repo, release_id: release.id, body });
+                core.info('Refreshed release notes');
+              }
             } catch (e) {
               if (e.status !== 404) throw e;
-              const body = [
-                '<details open>',
-                '',
-                process.env.RELEASE_SUMMARY,
-                '',
-                '</details>',
-                '',
-                '**Linux:**',
-                `- [Ubuntu x64 (CPU)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-x64.tar.gz)`,
-                `- [Ubuntu x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz)`,
-                '- Ubuntu x64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-x64.tar.xz` (replace XX with your GPU compute capability)',
-                `- [Ubuntu x64 (OpenVINO 2026.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz)`,
-                `- [Ubuntu x64 (SYCL / Intel GPU, Ubuntu 24.04)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-sycl-x64-ubuntu-2404.tar.gz)`,
-                '- Ubuntu x64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-x64-ubuntu-XXXX.tar.xz` (choose the matching Ubuntu version: 2204 or 2404)',
-                '- Ubuntu ARM64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz` (Ubuntu 24.04 LTS, ARM64 only)',
-                '',
-                '**Windows:**',
-                `- [Windows x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-rocm-7.13-x64.zip)`,
-                '- Windows x64 (CUDA): `llama-' + tag + '-windows-cuda-sm_XX-x64.7z` (replace XX with your GPU compute capability)',
-                `- [Windows x64 (Vulkan 1.4.309.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-win-vulkan-x64.zip)`,
-                '',
-                '**macOS:**',
-                `- [macOS ARM64 (Metal)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-macos-metal-arm64.tar.gz)`,
-              ].join('\n');
               try {
-                release = (await github.rest.repos.createRelease({ owner, repo, tag_name: tag, body })).data;
+                release = (await github.rest.repos.createRelease({ owner, repo, tag_name: tag, name: `llama.cpp ${tag}`, body })).data;
                 core.info(`Created release ${tag} (id ${release.id})`);
               } catch (createError) {
                 if (createError.status !== 422) throw createError;
@@ -2027,3 +2089,50 @@ jobs:
             }
 
             core.info(`Done: ${uploaded} uploaded, ${skipped} already present, ${files.length} total.`);
+
+  # Independent post-upload gate: read the release's assets back through the
+  # API and compare against the full expected manifest. This is the last line
+  # of defense against a half-populated release (v0.4.1 shipped 10 of 27
+  # assets with a green run); any gap fails the run loudly and lists exactly
+  # what is missing so it can be refilled with a force_build re-run.
+  verify-release:
+    name: Verify release assets complete
+    needs: [resolve-upstream-tag, release]
+    if: needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check every expected asset is on the release
+        uses: actions/github-script@v8
+        env:
+          EXPECTED_TAG: ${{ needs.resolve-upstream-tag.outputs.tag }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = process.env.EXPECTED_TAG;
+            const { owner, repo } = context.repo;
+            // Must mirror the manifest in the release job's
+            // "Check release artifacts" step (and the build matrices).
+            const expected = new Set([
+              `llama-${tag}-bin-ubuntu-x64.tar.gz`,
+              `llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz`,
+              `llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz`,
+              `llama-${tag}-bin-ubuntu-sycl-x64-ubuntu-2404.tar.gz`,
+              ...['70', '75', '80', '86', '89', '90', '100', '120'].map((sm) => `llama-${tag}-ubuntu-cuda-sm_${sm}-x64.tar.xz`),
+              `llama-${tag}-ubuntu-vulkan-x64-ubuntu-2204.tar.xz`,
+              `llama-${tag}-ubuntu-vulkan-x64-ubuntu-2404.tar.xz`,
+              `llama-${tag}-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz`,
+              `llama-${tag}-bin-win-cpu-x64.zip`,
+              `llama-${tag}-bin-win-rocm-7.13-x64.zip`,
+              `llama-${tag}-bin-win-vulkan-x64.zip`,
+              ...['70', '75', '80', '86', '89', '90', '100', '120'].map((sm) => `llama-${tag}-windows-cuda-sm_${sm}-x64.7z`),
+              `llama-${tag}-bin-macos-metal-arm64.tar.gz`,
+            ]);
+            const release = (await github.rest.repos.getReleaseByTag({ owner, repo, tag })).data;
+            const assets = await github.paginate(github.rest.repos.listReleaseAssets, { owner, repo, release_id: release.id });
+            const actual = new Set(assets.map((a) => a.name));
+            const missing = [...expected].filter((f) => !actual.has(f));
+            for (const f of missing) core.error(`Missing release asset: ${f}`);
+            core.info(`Release ${tag} has ${actual.size} asset(s); manifest expects ${expected.size}.`);
+            if (missing.length > 0) {
+              throw new Error(`Release ${tag} is incomplete: ${missing.length} asset(s) missing`);
+            }
