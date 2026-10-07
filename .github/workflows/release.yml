@@ -541,8 +541,12 @@ jobs:
               exit 1
             fi
 
-            # libOpenCL is optional (Intel GPU acceleration); skip it
-            missing=$(ldd "$f" | awk '/=> not found/ && $1 != "libOpenCL.so.1" { print }')
+            # libOpenCL (GPU plugin) and libze_loader (Level Zero, needed by the
+            # NPU vm runtime) are driver-stack components: the OpenVINO toolkit
+            # doesn't ship them and CI runners have no GPU driver, so they only
+            # resolve on end-user machines with an Intel GPU/NPU driver stack.
+            # Never bundle; treat them as resolved.
+            missing=$(ldd "$f" | awk '/=> not found/ && $1 != "libOpenCL.so.1" && $1 != "libze_loader.so.1" { print }')
             if [ -n "$missing" ]; then
               echo "::error::Unresolved runtime dependencies for $f"
               echo "$missing"
