@@ -93,7 +93,7 @@ jobs:
   ubuntu-cpu:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Clone
@@ -107,7 +107,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: ubuntu-cpu-x64
+          key: ubuntu-cpu-x64-2404
           evict-old-files: 1d
 
       - name: Dependencies
@@ -152,10 +152,10 @@ jobs:
           path: llama-bin-ubuntu-x64.tar.gz
           name: llama-bin-ubuntu-x64.tar.gz
 
-  ubuntu-22-rocm:
+  ubuntu-24-rocm:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     strategy:
       matrix:
@@ -176,7 +176,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: ubuntu-rocm-${{ matrix.ROCM_VERSION }}-${{ matrix.build }}
+          key: ubuntu-rocm-${{ matrix.ROCM_VERSION }}-${{ matrix.build }}-2404
           evict-old-files: 1d
 
       - name: Dependencies
@@ -193,7 +193,7 @@ jobs:
             gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
 
           sudo tee /etc/apt/sources.list.d/rocm.list << EOF
-          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${{ matrix.ROCM_VERSION }} jammy main
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${{ matrix.ROCM_VERSION }} noble main
           EOF
 
           sudo tee /etc/apt/preferences.d/rocm-pin-600 << EOF
@@ -255,10 +255,10 @@ jobs:
           path: llama-bin-ubuntu-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.tar.gz
           name: llama-bin-ubuntu-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.tar.gz
 
-  ubuntu-22-cuda:
+  ubuntu-24-cuda:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     strategy:
       fail-fast: false
@@ -279,7 +279,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: ubuntu-cuda-${{ matrix.sm }}
+          key: ubuntu-cuda-${{ matrix.sm }}-2404
           evict-old-files: 1d
 
       - name: Free disk space
@@ -291,7 +291,7 @@ jobs:
 
       - name: Install CUDA Toolkit
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           # Drop flaky third-party apt sources (packages.microsoft.com
           # intermittently 403s on GitHub runners) so apt-get update can refresh
@@ -421,14 +421,16 @@ jobs:
           path: llama-ubuntu-cuda-${{ matrix.sm }}-x64.tar.xz
           name: llama-ubuntu-cuda-${{ matrix.sm }}-x64.tar.xz
 
-  ubuntu-22-openvino:
+  ubuntu-24-openvino:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     env:
-      OPENVINO_VERSION_MAJOR: "2026.0"
-      OPENVINO_VERSION_FULL: "2026.0.0.20965.c6d6a13a886"
+      # >= 2026.3 required: the upstream ggml-openvino backend reads
+      # ov::ProfilingInfo::start_time, which OpenVINO added in 2026.3.
+      OPENVINO_VERSION_MAJOR: "2026.4"
+      OPENVINO_VERSION_FULL: "2026.4.0.22959.99c81491cc3"
 
     steps:
       - name: Clone
@@ -442,7 +444,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: ubuntu-openvino
+          key: ubuntu-openvino-2404
           evict-old-files: 1d
 
       - name: Dependencies
@@ -457,6 +459,7 @@ jobs:
           path: ${{ github.workspace }}/openvino
           version_major: ${{ env.OPENVINO_VERSION_MAJOR }}
           version_full: ${{ env.OPENVINO_VERSION_FULL }}
+          ubuntu_version: "ubuntu24"
 
       - name: Install OpenVINO dependencies
         run: |
@@ -565,16 +568,16 @@ jobs:
           name: llama-bin-ubuntu-openvino-${{ env.OPENVINO_VERSION_MAJOR }}-x64.tar.gz
 
   # Intel GPU build via the SYCL backend (oneAPI DPC++ toolchain). Mirrors the
-  # ubuntu-22-openvino job's packaging discipline (runtime libs bundled next to
+  # ubuntu-24-openvino job's packaging discipline (runtime libs bundled next to
   # the binaries, $ORIGIN RPATH, ldd validation) since both ship an Intel GPU
   # runtime that the host's driver resolves at load time. Only Intel GPUs are
   # available on the runner (none, in CI), so the smoke test is limited to
   # `--version` — same as the OpenVINO job.
   #
-  # Runs on Ubuntu 24.04 per request; the artifact name carries -ubuntu-2404
-  # to advertise the newer glibc baseline vs the 22.04-built Linux packages.
-  # oneAPI toolchain (DPC++ + MKL devel + oneDNN devel) is installed from
-  # Intel's apt repo; Level Zero comes from oneapi-src GitHub release .debs.
+  # The artifact name carries -ubuntu-2404 (all Linux packages are built on
+  # Ubuntu 24.04); the suffix is kept for continuity with existing download
+  # scripts. oneAPI toolchain (DPC++ + MKL devel + oneDNN devel) is installed
+  # from Intel's apt repo; Level Zero comes from oneapi-src GitHub release .debs.
   ubuntu-24-sycl:
     needs: resolve-upstream-tag
     if: needs.resolve-upstream-tag.outputs.should_build == 'true'
@@ -880,11 +883,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Build across the supported Ubuntu range: 22.04 (oldest, lowest glibc
-        # — portable to anything newer) up to 24.04 (current LTS/latest).
+        # Single 24.04 baseline for every Linux build (kept as a matrix so a
+        # future LTS leg can be added without touching the step bodies).
         include:
-          - os: ubuntu-22.04
-            ubuntu_version: "2204"
           - os: ubuntu-24.04
             ubuntu_version: "2404"
 
@@ -1032,9 +1033,8 @@ jobs:
   # publishes x86_64 Linux tarballs, so this job cannot reuse the
   # linux-setup-vulkan action. Instead glslc comes from Ubuntu's `universe` apt
   # repo — but that package is ONLY built for arm64 on 24.04 (noble), not on
-  # 22.04 (jammy). So unlike the x86_64 Vulkan job there is no 22.04/24.04
-  # glibc-portability matrix here: only ubuntu-24.04-arm is supported. This
-  # matches what upstream ggml-org/llama.cpp ships. Everything else mirrors the
+  # 22.04 (jammy), which is why arm64 never had a 22.04 build leg. This matches
+  # what upstream ggml-org/llama.cpp ships. Everything else mirrors the
   # x86_64 Vulkan job ($ORIGIN RPATH, patchelf, ldd validation).
   ubuntu-arm-vulkan:
     needs: resolve-upstream-tag
@@ -1778,9 +1778,9 @@ jobs:
       - windows-cuda
       - windows-vulkan
       - ubuntu-cpu
-      - ubuntu-22-rocm
-      - ubuntu-22-cuda
-      - ubuntu-22-openvino
+      - ubuntu-24-rocm
+      - ubuntu-24-cuda
+      - ubuntu-24-openvino
       - ubuntu-24-sycl
       - ubuntu-vulkan
       - ubuntu-arm-vulkan
@@ -1909,19 +1909,18 @@ jobs:
           set -euo pipefail
           tag='${{ steps.tag.outputs.name }}'
           # Full manifest mirroring the build matrices. The ROCm (7.13) and
-          # OpenVINO (2026.0) versions are baked into the asset names — keep
+          # OpenVINO (2026.4) versions are baked into the asset names — keep
           # in sync with the ROCM matrix and OPENVINO_VERSION_MAJOR.
           expected=(
             "llama-${tag}-bin-ubuntu-x64.tar.gz"
             "llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz"
-            "llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz"
+            "llama-${tag}-bin-ubuntu-openvino-2026.4-x64.tar.gz"
             "llama-${tag}-bin-ubuntu-sycl-x64-ubuntu-2404.tar.gz"
           )
           for sm in 70 75 80 86 89 90 100 120; do
             expected+=("llama-${tag}-ubuntu-cuda-sm_${sm}-x64.tar.xz")
           done
           expected+=(
-            "llama-${tag}-ubuntu-vulkan-x64-ubuntu-2204.tar.xz"
             "llama-${tag}-ubuntu-vulkan-x64-ubuntu-2404.tar.xz"
             "llama-${tag}-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz"
             "llama-${tag}-bin-win-cpu-x64.zip"
@@ -1975,9 +1974,9 @@ jobs:
               `- [Ubuntu x64 (CPU)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-x64.tar.gz)`,
               `- [Ubuntu x64 (ROCm 7.13)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz)`,
               '- Ubuntu x64 (CUDA): `llama-' + tag + '-ubuntu-cuda-sm_XX-x64.tar.xz` (replace XX with your GPU compute capability)',
-              `- [Ubuntu x64 (OpenVINO 2026.0)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz)`,
+              `- [Ubuntu x64 (OpenVINO 2026.4)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-openvino-2026.4-x64.tar.gz)`,
               `- [Ubuntu x64 (SYCL / Intel GPU, Ubuntu 24.04)](https://github.com/${owner}/${repo}/releases/download/${tag}/llama-${tag}-bin-ubuntu-sycl-x64-ubuntu-2404.tar.gz)`,
-              '- Ubuntu x64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-x64-ubuntu-XXXX.tar.xz` (choose the matching Ubuntu version: 2204 or 2404)',
+              '- Ubuntu x64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-x64-ubuntu-2404.tar.xz` (Ubuntu 24.04 LTS)',
               '- Ubuntu ARM64 (Vulkan): `llama-' + tag + '-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz` (Ubuntu 24.04 LTS, ARM64 only)',
               '',
               '**Windows:**',
@@ -2115,10 +2114,9 @@ jobs:
             const expected = new Set([
               `llama-${tag}-bin-ubuntu-x64.tar.gz`,
               `llama-${tag}-bin-ubuntu-rocm-7.13-x64.tar.gz`,
-              `llama-${tag}-bin-ubuntu-openvino-2026.0-x64.tar.gz`,
+              `llama-${tag}-bin-ubuntu-openvino-2026.4-x64.tar.gz`,
               `llama-${tag}-bin-ubuntu-sycl-x64-ubuntu-2404.tar.gz`,
               ...['70', '75', '80', '86', '89', '90', '100', '120'].map((sm) => `llama-${tag}-ubuntu-cuda-sm_${sm}-x64.tar.xz`),
-              `llama-${tag}-ubuntu-vulkan-x64-ubuntu-2204.tar.xz`,
               `llama-${tag}-ubuntu-vulkan-x64-ubuntu-2404.tar.xz`,
               `llama-${tag}-ubuntu-vulkan-arm64-ubuntu-2404.tar.xz`,
               `llama-${tag}-bin-win-cpu-x64.zip`,
