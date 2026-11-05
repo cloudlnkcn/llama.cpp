@@ -1287,6 +1287,26 @@ jobs:
           echo "$rocmPath\bin" >> $env:GITHUB_PATH
           echo "$rocmPath\lib\llvm\bin" >> $env:GITHUB_PATH
 
+      # Upstream v0.9.0 (#31329) embeds an app manifest (UTF-8 code page,
+      # long-path aware) in every Windows exe. lld-link — the linker TheRock's
+      # GNU-like clang driver uses here — shells out to the MSVC manifest tool
+      # mt.exe for that embedding. The other Windows jobs pick mt.exe up from
+      # vcvarsall.bat; this job never sets up the MSVC environment, so add the
+      # Windows SDK bin dir to PATH explicitly. Without it every exe link fails
+      # with "lld-link: error: unable to find mt.exe in PATH".
+      - name: Add Windows SDK bin to PATH (mt.exe for manifest embedding)
+        run: |
+          $sdkRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
+          $sdkBin = Get-ChildItem $sdkRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+          if (-not $sdkBin -or -not (Test-Path (Join-Path $sdkBin.FullName 'x64\mt.exe'))) {
+            throw "mt.exe not found under $sdkRoot — cannot link manifest-embedded Windows exes"
+          }
+          Write-Host "Adding $($sdkBin.FullName)\x64 to PATH (provides mt.exe)"
+          echo "$($sdkBin.FullName)\x64" >> $env:GITHUB_PATH
+
       - name: Build
         run: |
           mkdir build
